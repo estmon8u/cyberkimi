@@ -1,0 +1,67 @@
+name: Import preserved CyberKimi history
+
+on:
+  push:
+    branches:
+      - bootstrap/replay-cyberkimi-v0.1
+    paths:
+      - .github/workflows/import-cyberkimi.yml
+      - bootstrap/CyberKimi.bundle.b64.part-*.txt
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-cyberkimi-history
+  cancel-in-progress: false
+
+jobs:
+  import-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out bootstrap branch
+        uses: actions/checkout@v4
+        with:
+          ref: bootstrap/replay-cyberkimi-v0.1
+          fetch-depth: 0
+
+      - name: Check whether all bundle chunks are present
+        id: chunks
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=5
+          found="$(find bootstrap -maxdepth 1 -type f -name 'CyberKimi.bundle.b64.part-*.txt' 2>/dev/null | wc -l | tr -d ' ')"
+          if [[ "$found" != "$expected" ]]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Waiting for all bundle chunks: found $found of $expected."
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Reassemble and verify bundle
+        if: steps.chunks.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat bootstrap/CyberKimi.bundle.b64.part-*.txt | base64 --decode > /tmp/CyberKimi.bundle
+          echo '7c86859f3a1434c02024c0e6cf79679509e9d21cc4605f8dc2ae5b0dbd886fc0  /tmp/CyberKimi.bundle' | sha256sum --check --strict
+          git bundle verify /tmp/CyberKimi.bundle
+
+      - name: Import exact phase history
+        if: steps.chunks.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch /tmp/CyberKimi.bundle \
+            refs/heads/build/cyberkimi-v0.1:refs/remotes/preserved/build/cyberkimi-v0.1
+          imported_sha="$(git rev-parse refs/remotes/preserved/build/cyberkimi-v0.1)"
+          expected_sha='40ceb56ab181175fd673d2966f5f6e019261d39e'
+          test "$imported_sha" = "$expected_sha"
+          git push origin \
+            refs/remotes/preserved/build/cyberkimi-v0.1:refs/heads/build/cyberkimi-v0.1 \
+            --force
+          remote_sha="$(git ls-remote origin refs/heads/build/cyberkimi-v0.1 | cut -f1)"
+          test "$remote_sha" = "$expected_sha"
+          echo "Imported CyberKimi phase history at $remote_sha"
