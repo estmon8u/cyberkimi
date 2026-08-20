@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/import-cyberkimi.yml
       - bootstrap/CyberKimi.bundle.b64.part-*.txt
+      - bootstrap/chunks.sha256
 
 permissions:
   contents: write
@@ -26,26 +27,37 @@ jobs:
           ref: bootstrap/replay-cyberkimi-v0.1
           fetch-depth: 0
 
-      - name: Check whether all bundle chunks are present
+      - name: Check whether all bundle segments are present
         id: chunks
         shell: bash
         run: |
           set -euo pipefail
-          expected=19
+          expected=24
           found="$(find bootstrap -maxdepth 1 -type f -name 'CyberKimi.bundle.b64.part-*.txt' 2>/dev/null | wc -l | tr -d ' ')"
           if [[ "$found" != "$expected" ]]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "Waiting for all bundle chunks: found $found of $expected."
+            echo "Waiting for all bundle segments: found $found of $expected."
             exit 0
           fi
           echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify every transport segment
+        if: steps.chunks.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bootstrap
+          sha256sum --check --strict chunks.sha256
 
       - name: Reassemble and verify bundle
         if: steps.chunks.outputs.ready == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          cat bootstrap/CyberKimi.bundle.b64.part-*.txt | base64 --decode > /tmp/CyberKimi.bundle
+          find bootstrap -maxdepth 1 -type f -name 'CyberKimi.bundle.b64.part-*.txt' -print0 \
+            | LC_ALL=C sort -z \
+            | xargs -0 cat \
+            | base64 --decode > /tmp/CyberKimi.bundle
           echo '7c86859f3a1434c02024c0e6cf79679509e9d21cc4605f8dc2ae5b0dbd886fc0  /tmp/CyberKimi.bundle' | sha256sum --check --strict
           git bundle verify /tmp/CyberKimi.bundle
 
