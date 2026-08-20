@@ -1,0 +1,58 @@
+internal_id: lab.evaluate_security_property@1.0.0
+name: lab.evaluate_security_property
+version: 1.0.0
+kimi_alias: lab_evaluate_security_property_v1
+category: lab_validation
+description: Execute one predefined security-property template against a declared lab asset.
+accepted_assets: [lab]
+arguments_schema:
+  type: object
+  properties:
+    template: {type: string, enum: [http_status, header_present, service_running]}
+    service: {type: string, minLength: 1, maxLength: 128}
+    timeout_seconds: {type: integer, minimum: 1, maximum: 300}
+  required: [template, service, timeout_seconds]
+  additionalProperties: false
+base_profile:
+  name: observed
+  risk_tier: R2_OBSERVATION
+  effects: [process.local, container.read, network.observed]
+  network: true
+  filesystem: read_only
+  trust_profile: RESTRICTED
+  runtime:
+    timeout_seconds: 60
+    cpu_limit: 1
+    memory_mb: 512
+    process_limit: 32
+    output_bytes: 1000000
+authorized_profiles:
+  - name: active_validation
+    risk_tier: R3_ACTIVE_VALIDATION
+    effects: [process.local, container.read, network.observed]
+    network: true
+    filesystem: read_only
+    trust_profile: RESTRICTED
+    requires_engagement_flag: extended_operations
+    requires_approval: true
+    runtime:
+      timeout_seconds: 300
+      cpu_limit: 2
+      memory_mb: 1024
+      process_limit: 64
+      output_bytes: 5000000
+  - name: comprehensive
+    risk_tier: R4_EXTENDED_OPERATIONS
+    effects: [process.local, process.elevated, network.active]
+    network: true
+    filesystem: read_write
+    trust_profile: COMPREHENSIVE
+    requires_engagement_flag: comprehensive_assessment
+    requires_approval: true
+    kill_switch_required: true
+    runtime:
+      timeout_seconds: 3600
+      cpu_limit: 8
+      memory_mb: 8192
+      process_limit: 512
+      output_bytes: 50000000
