@@ -1,0 +1,26 @@
+internal_id: logs.parse@1.0.0
+name: logs.parse
+version: 1.0.0
+kimi_alias: logs_parse_v1
+category: incident_response
+description: Normalize bounded events from a declared log source and order them by timestamp.
+accepted_assets: [log_source]
+arguments_schema:
+  type: object
+  properties:
+    path: {type: string, minLength: 1, maxLength: 1024}
+    max_events: {type: integer, minimum: 1, maximum: 10000, default: 1000}
+  additionalProperties: false
+base_profile:
+  name: restricted
+  risk_tier: R1_READ_ONLY
+  effects: [file.read, parser.execute]
+  network: false
+  filesystem: read_only
+  trust_profile: RESTRICTED
+  runtime:
+    timeout_seconds: 60
+    cpu_limit: 1
+    memory_mb: 512
+    process_limit: 16
+    output_bytes: 10000000
