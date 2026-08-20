@@ -1,0 +1,27 @@
+internal_id: repository.search@1.0.0
+name: repository.search
+version: 1.0.0
+kimi_alias: repository_search_v1
+category: source_analysis
+description: Search text within a declared repository and return bounded source locations.
+accepted_assets: [repository]
+arguments_schema:
+  type: object
+  properties:
+    query: {type: string, minLength: 1, maxLength: 256}
+    max_results: {type: integer, minimum: 1, maximum: 200, default: 50}
+  required: [query]
+  additionalProperties: false
+base_profile:
+  name: restricted
+  risk_tier: R1_READ_ONLY
+  effects: [file.read, file.search]
+  network: false
+  filesystem: read_only
+  trust_profile: RESTRICTED
+  runtime:
+    timeout_seconds: 60
+    cpu_limit: 1
+    memory_mb: 512
+    process_limit: 32
+    output_bytes: 1000000
