@@ -1,0 +1,25 @@
+internal_id: dependency.extract@1.0.0
+name: dependency.extract
+version: 1.0.0
+kimi_alias: dependency_extract_v1
+category: supply_chain
+description: Extract normalized dependency records from a declared repository without network access.
+accepted_assets: [repository]
+arguments_schema:
+  type: object
+  properties:
+    path: {type: string, minLength: 1, maxLength: 1024, default: requirements.txt}
+  additionalProperties: false
+base_profile:
+  name: restricted
+  risk_tier: R1_READ_ONLY
+  effects: [file.read]
+  network: false
+  filesystem: read_only
+  trust_profile: RESTRICTED
+  runtime:
+    timeout_seconds: 30
+    cpu_limit: 1
+    memory_mb: 256
+    process_limit: 16
+    output_bytes: 1000000
