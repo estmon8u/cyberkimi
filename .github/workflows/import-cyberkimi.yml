@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t parts < <(awk '{print "bootstrap/" $2}' bootstrap/chunks.sha256)
-          if [[ "${#parts[@]}" -ne 24 ]]; then
+          if [[ "${#parts[@]}" -ne 30 ]]; then
             echo "Unexpected transport manifest size: ${#parts[@]}" >&2
             exit 1
           fi
