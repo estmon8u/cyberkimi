@@ -27,37 +27,38 @@ jobs:
           ref: bootstrap/replay-cyberkimi-v0.1
           fetch-depth: 0
 
-      - name: Check whether all bundle segments are present
+      - name: Check whether every declared transport segment is present
         id: chunks
         shell: bash
         run: |
           set -euo pipefail
-          expected=24
-          found="$(find bootstrap -maxdepth 1 -type f -name 'CyberKimi.bundle.b64.part-*.txt' 2>/dev/null | wc -l | tr -d ' ')"
-          if [[ "$found" != "$expected" ]]; then
+          mapfile -t parts < <(awk '{print "bootstrap/" $2}' bootstrap/chunks.sha256)
+          if [[ "${#parts[@]}" -ne 24 ]]; then
+            echo "Unexpected transport manifest size: ${#parts[@]}" >&2
+            exit 1
+          fi
+          missing=0
+          for part in "${parts[@]}"; do
+            if [[ ! -f "$part" ]]; then
+              echo "Missing $part"
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "Waiting for all bundle segments: found $found of $expected."
             exit 0
           fi
           echo "ready=true" >> "$GITHUB_OUTPUT"
 
-      - name: Verify every transport segment
+      - name: Reassemble and verify preserved bundle
         if: steps.chunks.outputs.ready == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          cd bootstrap
-          sha256sum --check --strict chunks.sha256
-
-      - name: Reassemble and verify bundle
-        if: steps.chunks.outputs.ready == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          find bootstrap -maxdepth 1 -type f -name 'CyberKimi.bundle.b64.part-*.txt' -print0 \
-            | LC_ALL=C sort -z \
-            | xargs -0 cat \
-            | base64 --decode > /tmp/CyberKimi.bundle
+          mapfile -t parts < <(awk '{print "bootstrap/" $2}' bootstrap/chunks.sha256)
+          cat "${parts[@]}" | tr -d '\r\n\t ' > /tmp/CyberKimi.bundle.b64
+          echo 'fb3c7c9541d90783c954f3bbd209173606ba0c70e08f070c8aa80ff7f0aa3931  /tmp/CyberKimi.bundle.b64' | sha256sum --check --strict
+          base64 --decode /tmp/CyberKimi.bundle.b64 > /tmp/CyberKimi.bundle
           echo '7c86859f3a1434c02024c0e6cf79679509e9d21cc4605f8dc2ae5b0dbd886fc0  /tmp/CyberKimi.bundle' | sha256sum --check --strict
           git bundle verify /tmp/CyberKimi.bundle
 
