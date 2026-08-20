@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cyberkimi"
+version = "0.1.0"
+description = "Authorization-bound, evidence-first security analysis harness for Kimi K3"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "Esteban Montelongo"}]
+dependencies = [
+  "cryptography>=45,<48",
+  "httpx>=0.28,<1",
+  "jinja2>=3.1,<4",
+  "jsonschema>=4.23,<5",
+  "openai>=2.0,<3",
+  "packaging>=24,<27",
+  "pydantic>=2.10,<3",
+  "pyyaml>=6,<7",
+  "sqlalchemy>=2.0,<3",
+  "typer>=0.16,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<10",
+  "pytest-asyncio>=0.25,<2",
+  "pytest-cov>=6,<8",
+  "ruff>=0.11,<1",
+  "mypy>=1.15,<2",
+]
+docker = ["docker>=7,<8"]
+
+[project.scripts]
+cyberkimi = "cyberkimi.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cyberkimi"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --strict-config"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["cyberkimi"]
