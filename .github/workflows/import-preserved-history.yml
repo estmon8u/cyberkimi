@@ -1,0 +1,72 @@
+name: Import preserved CyberKimi history
+
+on:
+  push:
+    branches:
+      - import/full-cyberkimi-v0.1
+    paths:
+      - bootstrap-full/CyberKimiFull.bundle.b64.part-*
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-preserved-cyberkimi-history
+  cancel-in-progress: false
+
+jobs:
+  import-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out import branch
+        uses: actions/checkout@v4
+        with:
+          ref: import/full-cyberkimi-v0.1
+          fetch-depth: 0
+
+      - name: Require all verified transport segments
+        id: transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          found="$(find bootstrap-full -maxdepth 1 -type f -name 'CyberKimiFull.bundle.b64.part-*' 2>/dev/null | wc -l | tr -d ' ')"
+          if [[ "$found" != '6' ]]; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo "Waiting for all transport segments: $found of 6"
+            exit 0
+          fi
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Reassemble and verify exact Git bundle
+        if: steps.transport.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat bootstrap-full/CyberKimiFull.bundle.b64.part-* | tr -d '\r\n\t ' > /tmp/CyberKimiFull.bundle.b64
+          echo '505b1304d471f070872e5c3a9ed8b333c6af9b5a6992d56564927e365c5f943f  /tmp/CyberKimiFull.bundle.b64' | sha256sum --check --strict
+          base64 --decode /tmp/CyberKimiFull.bundle.b64 > /tmp/CyberKimiFull.bundle
+          echo '4281d482e1123f2c7ecd424c7d7597d91bef584cd864955c6711bf22ca7c5457  /tmp/CyberKimiFull.bundle' | sha256sum --check --strict
+          git bundle verify /tmp/CyberKimiFull.bundle
+
+      - name: Import phase history and update completion branch
+        if: steps.transport.outputs.ready == 'true'
+        shell: bash
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git fetch /tmp/CyberKimiFull.bundle refs/heads/main:refs/remotes/preserved/main
+          preserved_sha="$(git rev-parse refs/remotes/preserved/main)"
+          test "$preserved_sha" = 'bcb29ed49f57fe0f25b974b091d0c7e8c8aed928'
+          git fetch origin main
+          base_sha="$(git rev-parse origin/main)"
+          tree_sha="$(git rev-parse refs/remotes/preserved/main^{tree})"
+          merge_sha="$(printf '%s\n\n%s\n' 'feat: import complete CyberKimi v0.1 phase history' 'Preserve the full audited phase history while anchoring the completion branch to the current remote main.' | git commit-tree "$tree_sha" -p "$base_sha" -p "$preserved_sha")"
+          git push origin "$merge_sha:refs/heads/complete/cyberkimi-v0.1" --force
+          remote_sha="$(git ls-remote origin refs/heads/complete/cyberkimi-v0.1 | cut -f1)"
+          test "$remote_sha" = "$merge_sha"
+          echo "Imported preserved history at $remote_sha"
