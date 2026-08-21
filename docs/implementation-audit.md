@@ -8,6 +8,8 @@ The canonical package history contains immutable engagement and asset records, s
 
 The prior default-branch tree mixed root modules and same-named package directories. Python selected package directories at import time while parts of the CLI imported symbols from root modules, so the installed wheel failed at startup. The audit branch restores the exact hash-verified canonical history rather than maintaining two competing control planes.
 
+Canonical source restoration is gated by per-segment SHA-256 checks, the complete encoded-bundle digest, the decoded Git-bundle digest, and the expected canonical commit ID.
+
 ## Ordered completion backlog
 
 1. **Release foundation.** Use one package architecture, make CLI version/help behavior deterministic, run CI on the audit branch, and keep wheel-install smoke tests green.
