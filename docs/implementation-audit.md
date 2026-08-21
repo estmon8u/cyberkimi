@@ -4,11 +4,13 @@ This audit is scoped to the authorization-bound, evidence-first v0.1 product. Ki
 
 ## Verified baseline
 
-The default branch contains a deterministic repository-review path, immutable engagement and asset records, signed scope tokens and execution grants, typed tool manifests, local evidence storage and redaction, finding-state transitions, a Moonshot/Kimi client prototype, SQLite persistence, a CLI, packaging metadata, and an initial test workflow.
+The canonical package history contains immutable engagement and asset records, signed scope tokens and execution grants, typed tool manifests, bounded local adapters, evidence storage and redaction, finding-state transitions, Moonshot/Kimi integration, SQLite persistence, repository-review orchestration, reporting, packaging metadata, and 77 passing local tests.
+
+The prior default-branch tree mixed root modules and same-named package directories. Python selected package directories at import time while parts of the CLI imported symbols from root modules, so the installed wheel failed at startup. The audit branch restores the exact hash-verified canonical history rather than maintaining two competing control planes.
 
 ## Ordered completion backlog
 
-1. **Release foundation.** Make CLI version/help behavior deterministic, run CI on the audit branch, and keep wheel-install smoke tests green.
+1. **Release foundation.** Use one package architecture, make CLI version/help behavior deterministic, run CI on the audit branch, and keep wheel-install smoke tests green.
 2. **v0.1 security ceiling.** Remove R4/extended/comprehensive execution from the v0.1 contracts and require exact human approval for every R3 action. Retain R0–R3 only.
 3. **Engagement lifecycle.** Add amend, revoke, approval, and inspection commands with immutable revision semantics and durable audit records.
 4. **Scratch validation.** Add isolated scratch worktrees for patch/test hypotheses; never modify the registered source tree.
