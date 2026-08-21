@@ -1,457 +1,255 @@
+"""Pure fail-closed policy evaluation and atomic authorization."""
+
 from __future__ import annotations
 
-import hashlib
-import json
-import secrets
-import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Final
 
-from .authorization import AuthorizationError, ScopeSigner
-from .domain import (
-    ActionApproval,
-    AssetRevision,
-    EngagementRevision,
-    ExecutionGrant,
+from jsonschema import Draft202012Validator
+from sqlalchemy import insert
+
+from cyberkimi.audit import AuditStore
+from cyberkimi.authorization import ApprovalService, GrantService, action_digest
+from cyberkimi.errors import ApprovalRequired, BudgetExceeded
+from cyberkimi.models import (
+    DecisionCode,
+    DeploymentProfile,
+    Engagement,
     PolicyDecision,
     ProposedAction,
     RiskTier,
+    TaskSpec,
     ToolManifest,
-    ToolProfile,
 )
-from .store import Database, canonical_json
+from cyberkimi.persistence import Database, budget_reservations
 
-
-class PolicyDenied(AuthorizationError):
-    def __init__(self, reason_code: str, message: str) -> None:
-        super().__init__(message)
-        self.reason_code = reason_code
+GLOBAL_EFFECT_CEILING: Final[frozenset[str]] = frozenset(
+    {
+        "repository.read",
+        "repository.search",
+        "repository.diff_read",
+        "process.local_readonly",
+        "artifact.read",
+        "artifact.write",
+        "lab.observe",
+        "lab.request_allowlisted",
+        "lab.reset",
+        "credential.inject_handle",
+        "source.patch_scratch",
+        "source.test_scratch",
+    }
+)
 
 
 @dataclass(frozen=True)
-class AuthorizationContext:
-    root_task_id: str
-    actor: str
-    now: datetime
-    preferred_profile: str | None = None
+class PolicyContext:
+    engagement: Engagement
+    task: TaskSpec
+    tool: ToolManifest
+    profile: DeploymentProfile
+    action: ProposedAction
+    approval_present: bool
 
 
 class PolicyEngine:
-    """Deterministic policy boundary.
+    version = "policy/v1.0.0"
 
-    Every successful authorization is one atomic SQLite transaction containing
-    profile resolution, approval handling, budget reservation, grant creation,
-    and append-only audit persistence. Adaptive changes are represented as
-    explicit before/after records, never as mutations of signed revisions.
-    """
+    def validate_profile(self, manifest: ToolManifest, profile: DeploymentProfile) -> None:
+        if profile.tool_template_id != manifest.template_id:
+            raise ValueError("deployment profile tool mismatch")
+        if profile.timeout_seconds > manifest.runtime.timeout_seconds_max:
+            raise ValueError("deployment profile widens timeout")
+        if profile.memory_mb > manifest.runtime.memory_mb_max:
+            raise ValueError("deployment profile widens memory")
+        if profile.output_bytes > manifest.runtime.output_bytes_max:
+            raise ValueError("deployment profile widens output limit")
+        if not profile.effects.issubset(manifest.maximum_effects):
+            raise ValueError("deployment profile adds effects")
+        if profile.risk_floor < manifest.minimum_risk:
+            raise ValueError("deployment profile lowers minimum risk")
+        if manifest.network_mode == "DENY_ALL" and profile.network_mode != "DENY_ALL":
+            raise ValueError("deployment profile widens network")
+        if manifest.source_mount in {"NONE", "READ_ONLY"} and profile.source_mount not in {
+            "NONE",
+            manifest.source_mount,
+        }:
+            raise ValueError("deployment profile widens source mount")
+
+    def evaluate(self, context: PolicyContext) -> PolicyDecision:
+        engagement = context.engagement
+        task = context.task
+        tool = context.tool
+        profile = context.profile
+        action = context.action
+        digest = action_digest(engagement, task, action, tool)
+        effective_risk = max(action.risk_tier, tool.minimum_risk, profile.risk_floor)
+        effective_effects = action.requested_effects
+
+        def decision(code: DecisionCode, reason: str, *, approval: bool = False) -> PolicyDecision:
+            return PolicyDecision(
+                code=code,
+                reason=reason,
+                action_digest=digest,
+                effective_risk=effective_risk,
+                effective_effects=effective_effects,
+                requires_approval=approval,
+                policy_version=self.version,
+            )
+
+        try:
+            self.validate_profile(tool, profile)
+        except ValueError as exc:
+            return decision(DecisionCode.DENY, str(exc))
+        if not engagement.active_at():
+            return decision(DecisionCode.DENY, "engagement revision is not active")
+        if task.engagement_id != engagement.engagement_id or task.engagement_revision != engagement.revision:
+            return decision(DecisionCode.DENY, "task engagement revision mismatch")
+        if task.asset_id != action.asset_id:
+            return decision(DecisionCode.DENY, "action asset differs from task asset")
+        try:
+            asset = engagement.asset(action.asset_id)
+        except KeyError:
+            return decision(DecisionCode.DENY, "action asset is not in the engagement")
+        if asset.status != "active":
+            return decision(DecisionCode.DENY, "asset is not active")
+        if asset.kind not in tool.accepted_asset_kinds:
+            return decision(DecisionCode.DENY, "tool does not accept the immutable asset kind")
+        if task.mode not in tool.modes:
+            return decision(DecisionCode.DENY, "tool is not eligible for the task mode")
+        if action.tool_template_id != tool.template_id:
+            return decision(DecisionCode.DENY, "action tool version mismatch")
+        if action.risk_tier < tool.minimum_risk:
+            return decision(DecisionCode.DENY, "action attempts to lower tool risk")
+        if effective_risk > engagement.risk_ceiling or effective_risk > task.risk_ceiling:
+            return decision(DecisionCode.NEEDS_SCOPE_AMENDMENT, "risk exceeds immutable ceiling")
+        if not effective_effects:
+            return decision(DecisionCode.DENY, "executable action must request explicit effects")
+        if not effective_effects.issubset(GLOBAL_EFFECT_CEILING):
+            return decision(DecisionCode.DENY, "effect exceeds global hard ceiling")
+        if not effective_effects.issubset(tool.maximum_effects):
+            return decision(DecisionCode.DENY, "effect exceeds tool manifest")
+        if not effective_effects.issubset(profile.effects):
+            return decision(DecisionCode.DENY, "effect exceeds deployment profile")
+        if not effective_effects.issubset(task.allowed_effects):
+            return decision(DecisionCode.NEEDS_SCOPE_AMENDMENT, "effect exceeds task scope")
+        if not effective_effects.issubset(asset.allowed_effects):
+            return decision(DecisionCode.NEEDS_SCOPE_AMENDMENT, "effect exceeds asset binding")
+        if effective_effects.intersection(engagement.prohibited_effects):
+            return decision(DecisionCode.DENY, "effect is explicitly prohibited")
+        if action.budget.runtime_seconds > engagement.budgets.max_single_tool_runtime_seconds:
+            return decision(DecisionCode.BUDGET_EXCEEDED, "single-tool runtime exceeds budget")
+        if tool.network_mode == "DENY_ALL" and profile.network_mode != "DENY_ALL":
+            return decision(DecisionCode.DENY, "network policy was widened")
+        if profile.network_mode == "LAB_ALLOWLIST" and not engagement.network_policy.allowed_endpoint_ids:
+            return decision(DecisionCode.DENY, "lab network profile has no registered endpoints")
+        errors = sorted(Draft202012Validator(tool.arguments_schema).iter_errors(action.arguments), key=str)
+        if errors:
+            return decision(DecisionCode.DENY, f"tool arguments invalid: {errors[0].message}")
+        requires_approval = (
+            effective_risk >= RiskTier.R3_BOUNDED_LAB_VALIDATION
+            or tool.default_approval_required
+        )
+        if requires_approval and not context.approval_present:
+            return decision(
+                DecisionCode.NEEDS_APPROVAL,
+                "exact action approval required",
+                approval=True,
+            )
+        return decision(DecisionCode.PERMIT, "all immutable policy intersections permit action")
+
+
+class AuthorizationCoordinator:
+    """Reserve budgets, bind approval, audit, and mint a grant in one transaction."""
 
     def __init__(
         self,
         database: Database,
-        signer: ScopeSigner,
-        *,
-        grant_ttl_seconds: int = 120,
-        r4_limit_per_hour: int = 10,
-    ) -> None:
+        audit: AuditStore,
+        policy: PolicyEngine,
+        approvals: ApprovalService,
+        grants: GrantService,
+    ):
         self.database = database
-        self.signer = signer
-        self.grant_ttl_seconds = grant_ttl_seconds
-        self.r4_limit_per_hour = r4_limit_per_hour
+        self.audit = audit
+        self.policy = policy
+        self.approvals = approvals
+        self.grants = grants
 
     def authorize(
         self,
-        action: ProposedAction,
-        engagement: EngagementRevision,
-        asset: AssetRevision,
+        engagement: Engagement,
+        task: TaskSpec,
         tool: ToolManifest,
-        context: AuthorizationContext,
-    ) -> PolicyDecision:
-        evaluation_pass = 1
-        adjustments: list[dict[str, Any]] = []
+        profile: DeploymentProfile,
+        action: ProposedAction,
+    ) -> tuple[PolicyDecision, str]:
+        digest = action_digest(engagement, task, action, tool)
+        approval_id: str | None = None
+        approval_present = False
         try:
-            with self.database.transaction() as connection:
-                self._validate_static(action, engagement, asset, tool, context)
-                profile, profile_adjustments = self._resolve_profile(
-                    action, engagement, asset, tool, context.preferred_profile
-                )
-                adjustments.extend(profile_adjustments)
-
-                approval = self._resolve_approval(
-                    connection, action, engagement, asset, tool, profile, context
-                )
-                self._reserve_budget(connection, action, engagement, context, profile)
-                if profile.risk_tier == RiskTier.R4_EXTENDED:
-                    self._reserve_r4_window(connection, engagement, context.now)
-
-                grant = self._create_grant(action, engagement, asset, tool, profile, context)
-                connection.execute(
-                    "INSERT INTO execution_grants "
-                    "(grant_id, nonce, engagement_id, action_id, grant_json, consumed_at, "
-                    "expires_at, created_at) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
-                    (
-                        grant.grant_id,
-                        grant.nonce,
-                        engagement.engagement_id,
-                        action.action_id,
-                        canonical_json(grant.model_dump(mode="json")),
-                        grant.expires_at.isoformat(),
-                        context.now.isoformat(),
-                    ),
-                )
-                self._append_audit(
-                    connection,
-                    engagement.engagement_id,
-                    "authorization.permitted",
-                    {
-                        "evaluation_pass": evaluation_pass,
-                        "action": action.model_dump(mode="json"),
-                        "engagement_revision": engagement.versioned_id,
-                        "asset_revision": asset.versioned_id,
-                        "tool_internal_id": tool.internal_id,
-                        "selected_profile": profile.model_dump(mode="json"),
-                        "approval_id": approval.approval_id if approval else None,
-                        "adjustments": adjustments,
-                        "grant_id": grant.grant_id,
-                    },
-                    context.now,
-                )
-                return PolicyDecision(
-                    permitted=True,
-                    reason_code="PERMITTED",
-                    evaluation_pass=evaluation_pass,
-                    selected_profile=profile.name,
-                    grant=grant,
-                    adjustments=tuple(adjustments),
-                )
-        except PolicyDenied as exc:
-            self._record_denial(action, engagement, asset, tool, context, exc)
-            return PolicyDecision(
-                permitted=False,
-                reason_code=exc.reason_code,
-                evaluation_pass=evaluation_pass,
-                requires_approval=exc.reason_code == "HUMAN_APPROVAL_REQUIRED",
-                adjustments=tuple(adjustments),
-            )
-
-    def consume_grant(self, grant: ExecutionGrant, *, now: datetime | None = None) -> None:
-        current = now or datetime.now(timezone.utc)
-        unsigned = grant.model_dump(mode="json", exclude={"signature"})
-        if not self.signer.verify(unsigned, grant.signature):
-            raise PolicyDenied("INVALID_GRANT", "execution grant signature is invalid")
-        if current >= grant.expires_at:
-            raise PolicyDenied("EXPIRED_GRANT", "execution grant has expired")
-        with self.database.transaction() as connection:
-            row = connection.execute(
-                "SELECT consumed_at, grant_json FROM execution_grants WHERE grant_id = ? AND nonce = ?",
-                (grant.grant_id, grant.nonce),
-            ).fetchone()
-            if row is None:
-                raise PolicyDenied("UNKNOWN_GRANT", "execution grant is not registered")
-            if row["consumed_at"] is not None:
-                raise PolicyDenied("REPLAYED_GRANT", "execution grant has already been consumed")
-            if json.loads(row["grant_json"]) != grant.model_dump(mode="json"):
-                raise PolicyDenied("GRANT_MISMATCH", "execution grant does not match stored grant")
-            connection.execute(
-                "UPDATE execution_grants SET consumed_at = ? WHERE grant_id = ?",
-                (current.isoformat(), grant.grant_id),
-            )
-            self._append_audit(
-                connection,
-                grant.engagement_revision.split("@", 1)[0],
-                "execution_grant.consumed",
-                {"grant_id": grant.grant_id, "nonce": grant.nonce},
-                current,
-            )
-
-    def _validate_static(
-        self,
-        action: ProposedAction,
-        engagement: EngagementRevision,
-        asset: AssetRevision,
-        tool: ToolManifest,
-        context: AuthorizationContext,
-    ) -> None:
-        if not engagement.active(context.now):
-            raise PolicyDenied("ENGAGEMENT_INACTIVE", "engagement is not active")
-        if action.engagement_id != engagement.engagement_id:
-            raise PolicyDenied("ENGAGEMENT_MISMATCH", "action engagement does not match")
-        if asset.engagement_id != engagement.engagement_id:
-            raise PolicyDenied("ASSET_ENGAGEMENT_MISMATCH", "asset belongs to another engagement")
-        if action.target_asset_id not in {asset.asset_alias, asset.versioned_id}:
-            raise PolicyDenied("ASSET_MISMATCH", "action target does not resolve to supplied asset")
-        if action.action_template not in {tool.internal_id, tool.kimi_alias}:
-            raise PolicyDenied("TOOL_MISMATCH", "action template does not identify supplied tool")
-        if asset.asset_type not in tool.accepted_asset_types:
-            raise PolicyDenied("ASSET_TYPE_UNSUPPORTED", "tool does not accept this asset type")
-        forbidden = action.requested_effects & engagement.prohibited_effects
-        if forbidden:
-            raise PolicyDenied(
-                "PROHIBITED_EFFECT",
-                f"action requested prohibited effects: {sorted(forbidden)}",
-            )
-
-    def _resolve_profile(
-        self,
-        action: ProposedAction,
-        engagement: EngagementRevision,
-        asset: AssetRevision,
-        tool: ToolManifest,
-        preferred_profile: str | None,
-    ) -> tuple[ToolProfile, list[dict[str, Any]]]:
-        authorized = []
-        for profile in (tool.base_profile, *tool.authorized_profiles):
-            if (
-                profile.requires_engagement_flag is not None
-                and profile.requires_engagement_flag not in engagement.capability_flags
-            ):
-                continue
-            if profile.risk_tier > engagement.maximum_risk_tier:
-                continue
-            if not action.requested_effects.issubset(profile.effects):
-                continue
-            if not profile.effects.issubset(asset.allowed_effects):
-                continue
-            if action.requested_timeout_seconds > profile.timeout_seconds:
-                continue
-            authorized.append(profile)
-        if preferred_profile:
-            preferred = next((p for p in authorized if p.name == preferred_profile), None)
-            if preferred is None:
-                raise PolicyDenied(
-                    "PROFILE_NOT_AUTHORIZED", "preferred deployment profile cannot satisfy action"
-                )
-            return preferred, []
-        if not authorized:
-            raise PolicyDenied(
-                "NO_AUTHORIZED_PROFILE", "no engagement-authorized profile can satisfy action"
-            )
-        selected = min(authorized, key=lambda item: (int(item.risk_tier), item.timeout_seconds))
-        adjustments: list[dict[str, Any]] = []
-        if selected.name != tool.base_profile.name:
-            adjustments.append(
-                {
-                    "kind": "deployment_profile_selection",
-                    "before": tool.base_profile.name,
-                    "after": selected.name,
-                    "reason": "base profile cannot satisfy action inside authorized scope",
-                }
-            )
-        return selected, adjustments
-
-    def _resolve_approval(
-        self,
-        connection: Any,
-        action: ProposedAction,
-        engagement: EngagementRevision,
-        asset: AssetRevision,
-        tool: ToolManifest,
-        profile: ToolProfile,
-        context: AuthorizationContext,
-    ) -> ActionApproval | None:
-        if profile.risk_tier < RiskTier.R3_BOUNDED_VALIDATION:
-            return None
-        rows = connection.execute(
-            "SELECT document_json FROM approvals WHERE engagement_id = ? "
-            "AND action_template = ? AND target_asset_revision = ? "
-            "AND tool_internal_id = ? AND expires_at > ? ORDER BY created_at DESC",
-            (
+            approval = self.approvals.require_valid(digest)
+            approval_id = approval.approval_id
+            approval_present = True
+        except ApprovalRequired:
+            pass
+        context = PolicyContext(
+            engagement=engagement,
+            task=task,
+            tool=tool,
+            profile=profile,
+            action=action,
+            approval_present=approval_present,
+        )
+        decision = self.policy.evaluate(context)
+        if decision.code is not DecisionCode.PERMIT:
+            self.audit.append(
                 engagement.engagement_id,
-                action.action_template,
-                asset.versioned_id,
-                tool.internal_id,
-                context.now.isoformat(),
-            ),
-        ).fetchall()
-        for row in rows:
-            approval = ActionApproval.model_validate(json.loads(row["document_json"]))
-            if action.requested_effects.issubset(approval.allowed_effects) and approval.permits_arguments(
-                action.arguments
-            ):
-                return approval
-        if not engagement.self_attested_approvals:
-            raise PolicyDenied("HUMAN_APPROVAL_REQUIRED", "matching action-class approval required")
-        approval = ActionApproval(
-            approval_id=f"APR-{uuid.uuid4().hex}",
-            engagement_id=engagement.engagement_id,
-            action_template=action.action_template,
-            target_asset_revision=asset.versioned_id,
-            tool_internal_id=tool.internal_id,
-            allowed_effects=action.requested_effects,
-            actor=context.actor,
-            issued_at=context.now,
-            expires_at=min(context.now + timedelta(minutes=15), engagement.expires_at),
-            auto_granted=True,
-        )
-        connection.execute(
-            "INSERT INTO approvals "
-            "(approval_id, engagement_id, action_template, target_asset_revision, "
-            "tool_internal_id, document_json, expires_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                approval.approval_id,
-                approval.engagement_id,
-                approval.action_template,
-                approval.target_asset_revision,
-                approval.tool_internal_id,
-                canonical_json(approval.model_dump(mode="json")),
-                approval.expires_at.isoformat(),
-                context.now.isoformat(),
-            ),
-        )
-        self._append_audit(
-            connection,
-            engagement.engagement_id,
-            "approval.auto_granted",
-            approval.model_dump(mode="json"),
-            context.now,
-        )
-        return approval
-
-    def _reserve_budget(
-        self,
-        connection: Any,
-        action: ProposedAction,
-        engagement: EngagementRevision,
-        context: AuthorizationContext,
-        profile: ToolProfile,
-    ) -> None:
-        row = connection.execute(
-            "SELECT * FROM budget_usage WHERE root_task_id = ?",
-            (context.root_task_id,),
-        ).fetchone()
-        current_calls = 0 if row is None else int(row["tool_calls"])
-        current_runtime = 0 if row is None else int(row["runtime_seconds"])
-        if current_calls + 1 > engagement.budget.max_tool_calls_per_task:
-            raise PolicyDenied("TOOL_CALL_BUDGET_EXHAUSTED", "root task tool-call ceiling reached")
-        reserved_runtime = min(action.requested_timeout_seconds, profile.timeout_seconds)
-        hard_runtime = engagement.budget.max_tool_runtime_seconds * max(
-            1, engagement.budget.max_tool_calls_per_task
-        )
-        if current_runtime + reserved_runtime > hard_runtime:
-            raise PolicyDenied("RUNTIME_BUDGET_EXHAUSTED", "root task runtime ceiling reached")
-        timestamp = context.now.isoformat()
-        if row is None:
-            connection.execute(
-                "INSERT INTO budget_usage "
-                "(root_task_id, engagement_id, tool_calls, runtime_seconds, artifact_bytes, "
-                "model_turns, updated_at) VALUES (?, ?, 1, ?, 0, 0, ?)",
-                (context.root_task_id, engagement.engagement_id, reserved_runtime, timestamp),
+                "policy.decision",
+                decision.model_dump(mode="json"),
             )
-        else:
-            connection.execute(
-                "UPDATE budget_usage SET tool_calls = tool_calls + 1, "
-                "runtime_seconds = runtime_seconds + ?, updated_at = ? WHERE root_task_id = ?",
-                (reserved_runtime, timestamp, context.root_task_id),
-            )
+            if decision.code is DecisionCode.NEEDS_APPROVAL:
+                raise ApprovalRequired(decision.reason)
+            if decision.code is DecisionCode.BUDGET_EXCEEDED:
+                raise BudgetExceeded(decision.reason)
+            raise PermissionError(decision.reason)
 
-    def _reserve_r4_window(
-        self, connection: Any, engagement: EngagementRevision, now: datetime
-    ) -> None:
-        cutoff = now - timedelta(hours=1)
-        connection.execute(
-            "DELETE FROM r4_execution_windows WHERE engagement_id = ? AND executed_at < ?",
-            (engagement.engagement_id, cutoff.isoformat()),
-        )
-        count = connection.execute(
-            "SELECT COUNT(*) AS count FROM r4_execution_windows WHERE engagement_id = ?",
-            (engagement.engagement_id,),
-        ).fetchone()["count"]
-        if int(count) >= self.r4_limit_per_hour:
-            raise PolicyDenied("R4_RATE_LIMITED", "engagement R4 rate limit reached")
-        connection.execute(
-            "INSERT INTO r4_execution_windows (engagement_id, executed_at) VALUES (?, ?)",
-            (engagement.engagement_id, now.isoformat()),
-        )
-
-    def _create_grant(
-        self,
-        action: ProposedAction,
-        engagement: EngagementRevision,
-        asset: AssetRevision,
-        tool: ToolManifest,
-        profile: ToolProfile,
-        context: AuthorizationContext,
-    ) -> ExecutionGrant:
-        unsigned = {
-            "grant_id": f"GRT-{uuid.uuid4().hex}",
-            "nonce": secrets.token_urlsafe(24),
-            "engagement_revision": engagement.versioned_id,
-            "asset_revision": asset.versioned_id,
-            "action_id": action.action_id,
-            "tool_internal_id": tool.internal_id,
-            "deployment_profile": profile.name,
-            "effective_effects": sorted(action.requested_effects),
-            "effective_timeout_seconds": min(
-                action.requested_timeout_seconds, profile.timeout_seconds
-            ),
-            "issued_at": context.now.isoformat(),
-            "expires_at": min(
-                context.now + timedelta(seconds=self.grant_ttl_seconds), engagement.expires_at
-            ).isoformat(),
-        }
-        signature = self.signer.sign(unsigned)
-        return ExecutionGrant.model_validate({**unsigned, "signature": signature})
-
-    def _append_audit(
-        self,
-        connection: Any,
-        engagement_id: str,
-        event_type: str,
-        payload: dict[str, Any],
-        created_at: datetime,
-    ) -> None:
-        previous = connection.execute(
-            "SELECT event_hash FROM audit_events WHERE engagement_id = ? "
-            "ORDER BY sequence DESC LIMIT 1",
-            (engagement_id,),
-        ).fetchone()
-        prior_hash = None if previous is None else str(previous["event_hash"])
-        event_id = f"AUD-{uuid.uuid4().hex}"
-        body = {
-            "event_id": event_id,
-            "engagement_id": engagement_id,
-            "event_type": event_type,
-            "payload": payload,
-            "prior_event_hash": prior_hash,
-            "created_at": created_at.isoformat(),
-        }
-        event_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
-        connection.execute(
-            "INSERT INTO audit_events "
-            "(event_id, engagement_id, event_type, payload_json, prior_event_hash, "
-            "event_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                event_id,
-                engagement_id,
-                event_type,
-                canonical_json(payload),
-                prior_hash,
-                event_hash,
-                created_at.isoformat(),
-            ),
-        )
-
-    def _record_denial(
-        self,
-        action: ProposedAction,
-        engagement: EngagementRevision,
-        asset: AssetRevision,
-        tool: ToolManifest,
-        context: AuthorizationContext,
-        error: PolicyDenied,
-    ) -> None:
         with self.database.transaction() as connection:
-            self._append_audit(
-                connection,
-                engagement.engagement_id,
-                "authorization.denied",
-                {
-                    "action_id": action.action_id,
-                    "asset_revision": asset.versioned_id,
-                    "tool_internal_id": tool.internal_id,
-                    "reason_code": error.reason_code,
-                    "message": str(error),
-                },
-                context.now,
+            used_calls, used_runtime, used_bytes = self.database.task_usage(task.task_id, connection)
+            next_calls = used_calls + action.budget.tool_calls
+            next_runtime = used_runtime + action.budget.runtime_seconds
+            next_bytes = used_bytes + action.budget.artifact_bytes
+            if next_calls > engagement.budgets.max_tool_calls_per_subtask:
+                raise BudgetExceeded("tool-call budget exceeded")
+            if next_runtime > engagement.budgets.max_total_tool_runtime_seconds:
+                raise BudgetExceeded("total runtime budget exceeded")
+            if next_bytes > engagement.budgets.max_artifact_bytes:
+                raise BudgetExceeded("artifact budget exceeded")
+            if decision.requires_approval:
+                approval = self.approvals.require_valid(digest, connection=connection, consume=True)
+                approval_id = approval.approval_id
+            connection.execute(
+                insert(budget_reservations).values(
+                    reservation_id=action.budget.reservation_id,
+                    task_id=task.task_id,
+                    action_digest=digest,
+                    tool_calls=action.budget.tool_calls,
+                    runtime_seconds=action.budget.runtime_seconds,
+                    artifact_bytes=action.budget.artifact_bytes,
+                    state="reserved",
+                    created_at=self.database.now(),
+                )
             )
+            self.audit.append(
+                engagement.engagement_id,
+                "policy.decision",
+                decision.model_dump(mode="json"),
+                connection=connection,
+            )
+            grant_token, _grant = self.grants.mint(
+                engagement.engagement_id,
+                action,
+                digest,
+                approval_id=approval_id,
+                connection=connection,
+            )
+        return decision, grant_token

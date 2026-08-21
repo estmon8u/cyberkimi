@@ -1,15 +1,12 @@
 # Changelog
 
-All notable changes to CyberKimi are recorded here.
-
 ## [0.1.0] - Unreleased
 
 ### Added
 
-- Engagement authorization, scope-token, policy, grant, evidence, findings, retry, tool-registry, operator, orchestration, persistence, and CLI foundations.
-- Initial unit and integration tests.
-- GitHub Actions CI for supported Python versions.
-
-### Status
-
-The implementation is being completed and verified on `main`. A release entry will replace this status once all tests and packaging checks pass.
+- Immutable engagement and asset contracts.
+- Ed25519 scope tokens and single-use execution grants.
+- Exact action approvals and atomic budget reservations.
+- Fail-closed policy intersection and audit hash chain.
+- Typed tool manifests, safe adapters, CAS artifacts, local encrypted vault, redaction, evidence envelopes, and independent finding verification.
+- Direct Kimi K3 structured-output provider boundary with complete assistant-message preservation and bounded retries.

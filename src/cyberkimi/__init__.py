@@ -1,10 +1,6 @@
-"""CyberKimi: authorization-bound, evidence-first security analysis."""
+"""CyberKimi secure security-analysis harness."""
 
-from importlib.metadata import PackageNotFoundError, version
+from cyberkimi.models import TaskMode
 
-try:
-    __version__ = version("cyberkimi")
-except PackageNotFoundError:  # pragma: no cover - editable source tree
-    __version__ = "0.1.0"
-
-__all__ = ["__version__"]
+__all__ = ["TaskMode", "__version__"]
+__version__ = "0.1.0"

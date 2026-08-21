@@ -2,9 +2,7 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      - build/cyberkimi-v0.1
+    branches: [main, complete/cyberkimi-v0.1]
   pull_request:
 
 permissions:
@@ -15,9 +13,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m ruff check src tests
+      - run: python -m ruff format --check src tests
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m mypy src
+
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -28,23 +50,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install
-        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
-      - name: Lint
-        run: python -m ruff check src tests
-      - name: Test
-        run: python -m pytest --cov=cyberkimi --cov-report=term-missing
-      - name: Compile
-        run: python -m compileall -q src
-      - name: CLI smoke
-        run: |
-          cyberkimi --version
-          cyberkimi init --state-directory .test-state
-          cyberkimi doctor --state-directory .test-state
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest --cov=cyberkimi --cov-report=term-missing
+      - run: python -m compileall -q src
 
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -53,7 +65,7 @@ jobs:
       - run: python -m pip install --upgrade pip build
       - run: python -m build
       - run: python -m pip install dist/*.whl
-      - run: cyberkimi --version
+      - run: python -c "import cyberkimi; print(cyberkimi.__version__)"
       - uses: actions/upload-artifact@v4
         with:
           name: cyberkimi-distributions

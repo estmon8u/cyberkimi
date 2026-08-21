@@ -1,291 +1,370 @@
+"""Content-addressed artifacts, local secret vault, redaction, and evidence envelopes."""
+
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import uuid
-from dataclasses import dataclass
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
+from sqlalchemy import insert, select
 
-from .data_handling import ModelContent, prepare_for_model
-from .domain import DataClassification, EvidenceRecord, VerificationResult
-from .store import Database, canonical_json
+from cyberkimi.audit import AuditStore
+from cyberkimi.canonical import canonical_bytes, sha256_bytes, sha256_digest
+from cyberkimi.errors import AuthorizationError, ValidationFailure
+from cyberkimi.ids import new_id
+from cyberkimi.models import ArtifactRecord, Engagement, EvidenceEnvelope, ToolManifest, ToolResult
+from cyberkimi.persistence import Database, artifacts, evidence, vault_records
 
+_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "private_key",
+        re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]{20,}?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    ),
+    (
+        "aws_access_key",
+        re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
+    ),
+    (
+        "github_token",
+        re.compile(r"(?<![A-Za-z0-9_])(?:ghp|github_pat)_[A-Za-z0-9_]{20,255}"),
+    ),
+    (
+        "jwt",
+        re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    ),
+    (
+        "generic_assignment",
+        re.compile(
+            r"(?i)(?P<prefix>\b(?:api[_-]?key|secret|token|password|passwd|client[_-]?secret)\b\s*[:=]\s*[\"']?)(?P<value>[A-Za-z0-9_./+\-=]{8,})(?P<suffix>[\"']?)"
+        ),
+    ),
+)
 
-class EvidenceError(RuntimeError):
-    pass
+_PII_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE),
+    re.compile(r"\b(?:\+?1[-. ]?)?\(?\d{3}\)?[-. ]?\d{3}[-. ]?\d{4}\b"),
+)
 
 
 class ArtifactStore:
-    def __init__(self, root: str | Path, database: Database) -> None:
-        self.root = Path(root)
+    def __init__(self, directory: Path, database: Database, audit: AuditStore):
+        self.directory = directory
         self.database = database
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.audit = audit
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    def persist(self, content: bytes, *, media_type: str = "application/octet-stream") -> str:
-        digest = hashlib.sha256(content).hexdigest()
-        path = self.root / "sha256" / digest[:2] / digest
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    def put(
+        self,
+        engagement_id: str,
+        data: bytes,
+        media_type: str,
+        *,
+        tool_run_id: str | None = None,
+    ) -> ArtifactRecord:
+        digest = sha256_bytes(data)
+        hex_digest = digest.split(":", 1)[1]
+        path = self.directory / hex_digest[:2] / hex_digest[2:]
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not path.exists():
-            temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-            descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            temporary = path.with_suffix(".tmp")
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
-                with os.fdopen(descriptor, "wb") as stream:
-                    stream.write(content)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, path)
+                os.write(descriptor, data)
+                os.fsync(descriptor)
             finally:
-                if temporary.exists():
-                    temporary.unlink()
+                os.close(descriptor)
+            os.replace(temporary, path)
+        record = ArtifactRecord(
+            artifact_id=new_id("ART"),
+            digest=digest,
+            media_type=media_type,
+            size_bytes=len(data),
+            local_path=str(path),
+            created_at=datetime.now(timezone.utc),
+            tool_run_id=tool_run_id,
+        )
+        with self.database.transaction() as connection:
+            existing = connection.execute(
+                select(artifacts.c.artifact_id).where(artifacts.c.digest == digest)
+            ).first()
+            if existing is None:
+                connection.execute(
+                    insert(artifacts).values(
+                        artifact_id=record.artifact_id,
+                        digest=digest,
+                        record_json=record.model_dump_json(),
+                        created_at=record.created_at,
+                    )
+                )
+            else:
+                row = connection.execute(
+                    select(artifacts.c.record_json).where(artifacts.c.digest == digest)
+                ).scalar_one()
+                record = ArtifactRecord.model_validate_json(str(row))
+            self.audit.append(
+                engagement_id,
+                "artifact.stored",
+                {
+                    "artifact_id": record.artifact_id,
+                    "digest": record.digest,
+                    "media_type": record.media_type,
+                    "size_bytes": record.size_bytes,
+                    "tool_run_id": tool_run_id,
+                },
+                connection=connection,
+            )
+        return record
+
+    def read(self, digest: str, *, max_bytes: int) -> bytes:
+        row = self.database.fetch_one(select(artifacts).where(artifacts.c.digest == digest))
+        if row is None:
+            raise KeyError(digest)
+        record = ArtifactRecord.model_validate_json(str(row["record_json"]))
+        if record.size_bytes > max_bytes:
+            raise ValidationFailure("artifact exceeds requested read budget")
+        data = Path(record.local_path).read_bytes()
+        if sha256_bytes(data) != digest:
+            raise ValidationFailure("artifact digest verification failed")
+        return data
+
+
+class SecretVault:
+    def __init__(self, key_path: Path, database: Database, audit: AuditStore):
+        self.key_path = key_path
+        self.database = database
+        self.audit = audit
+
+    def ensure_key(self) -> None:
+        self.key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.key_path.exists():
+            return
+        temporary = self.key_path.with_suffix(".tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(descriptor, Fernet.generate_key())
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, self.key_path)
+        os.chmod(self.key_path, 0o600)
+
+    def _fernet(self) -> Fernet:
+        self.ensure_key()
+        return Fernet(self.key_path.read_bytes())
+
+    def store(self, engagement_id: str, secret_type: str, plaintext: str) -> str:
+        secret_ref = new_id("SEC")
+        ciphertext = self._fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+        fingerprint = "sha256:" + hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
         with self.database.transaction() as connection:
             connection.execute(
-                "INSERT OR IGNORE INTO artifacts "
-                "(sha256, byte_count, media_type, storage_path, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    digest,
-                    len(content),
-                    media_type,
-                    str(path),
-                    datetime.now(timezone.utc).isoformat(),
-                ),
+                insert(vault_records).values(
+                    secret_ref=secret_ref,
+                    engagement_id=engagement_id,
+                    secret_type=secret_type,
+                    ciphertext=ciphertext,
+                    fingerprint=fingerprint,
+                    created_at=datetime.now(timezone.utc),
+                )
             )
-        return digest
+            self.audit.append(
+                engagement_id,
+                "secret.vaulted",
+                {
+                    "secret_ref": secret_ref,
+                    "secret_type": secret_type,
+                    "fingerprint": fingerprint,
+                },
+                connection=connection,
+            )
+        return secret_ref
 
-    def read(self, digest: str) -> bytes:
+    def reveal(self, engagement_id: str, secret_ref: str) -> str:
         row = self.database.fetch_one(
-            "SELECT storage_path FROM artifacts WHERE sha256 = ?", (digest,)
+            select(vault_records).where(
+                vault_records.c.secret_ref == secret_ref,
+                vault_records.c.engagement_id == engagement_id,
+            )
         )
         if row is None:
-            raise EvidenceError(f"unknown artifact: {digest}")
-        content = Path(row["storage_path"]).read_bytes()
-        if hashlib.sha256(content).hexdigest() != digest:
-            raise EvidenceError("artifact integrity check failed")
-        return content
-
-
-class CredentialVault:
-    """Local encrypted vault; raw values never become model-visible evidence."""
-
-    def __init__(self, root: str | Path, key: bytes) -> None:
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._fernet = Fernet(key)
-
-    @staticmethod
-    def generate_key() -> bytes:
-        return Fernet.generate_key()
-
-    def store(self, kind: str, fingerprint: str, value: str) -> str:
-        record_id = hashlib.sha256(f"{kind}:{fingerprint}".encode()).hexdigest()
-        destination = self.root / f"{record_id}.vault"
-        if not destination.exists():
-            payload = canonical_json(
-                {
-                    "kind": kind,
-                    "fingerprint": fingerprint,
-                    "value": value,
-                    "stored_at": datetime.now(timezone.utc).isoformat(),
-                }
-            ).encode()
-            encrypted = self._fernet.encrypt(payload)
-            temporary = destination.with_suffix(f".{uuid.uuid4().hex}.tmp")
-            descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            try:
-                with os.fdopen(descriptor, "wb") as stream:
-                    stream.write(encrypted)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, destination)
-            finally:
-                if temporary.exists():
-                    temporary.unlink()
-        return record_id
-
-    def retrieve_redacted(self, record_id: str) -> str:
-        path = self.root / f"{record_id}.vault"
-        if not path.exists():
-            raise EvidenceError("vault record does not exist")
+            raise KeyError(secret_ref)
         try:
-            document = json.loads(self._fernet.decrypt(path.read_bytes()))
-        except (InvalidToken, json.JSONDecodeError) as exc:
-            raise EvidenceError("vault integrity check failed") from exc
-        return f"<VAULT:{document['kind']}:{document['fingerprint'][:12]}>"
+            return self._fernet().decrypt(str(row["ciphertext"]).encode("ascii")).decode("utf-8")
+        except InvalidToken as exc:
+            raise AuthorizationError("vault ciphertext could not be authenticated") from exc
+
+    def list_metadata(self, engagement_id: str) -> list[dict[str, Any]]:
+        rows = self.database.fetch_all(
+            select(
+                vault_records.c.secret_ref,
+                vault_records.c.secret_type,
+                vault_records.c.fingerprint,
+                vault_records.c.created_at,
+            ).where(vault_records.c.engagement_id == engagement_id)
+        )
+        return rows
+
+
+class Redactor:
+    def __init__(self, vault: SecretVault):
+        self.vault = vault
+
+    def redact(
+        self,
+        engagement_id: str,
+        text: str,
+        *,
+        redact_pii: bool = True,
+    ) -> tuple[str, tuple[str, ...]]:
+        secret_refs: list[str] = []
+        result = text
+        for secret_type, pattern in _SECRET_PATTERNS:
+            if secret_type == "generic_assignment":
+
+                def replace_assignment(match: re.Match[str]) -> str:
+                    value = match.group("value")
+                    secret_ref = self.vault.store(engagement_id, secret_type, value)
+                    secret_refs.append(secret_ref)
+                    return f"{match.group('prefix')}<secret-ref:{secret_ref}>{match.group('suffix')}"
+
+                result = pattern.sub(replace_assignment, result)
+            else:
+
+                def replace_secret(match: re.Match[str], kind: str = secret_type) -> str:
+                    secret_ref = self.vault.store(engagement_id, kind, match.group(0))
+                    secret_refs.append(secret_ref)
+                    return f"<secret-ref:{secret_ref}>"
+
+                result = pattern.sub(replace_secret, result)
+        if redact_pii:
+            for pattern in _PII_PATTERNS:
+                result = pattern.sub("<pii-redacted>", result)
+        return result, tuple(secret_refs)
 
 
 class EvidenceStore:
     def __init__(
         self,
         database: Database,
-        artifacts: ArtifactStore,
-        vault: CredentialVault,
-    ) -> None:
+        audit: AuditStore,
+        artifacts_store: ArtifactStore,
+        redactor: Redactor,
+    ):
         self.database = database
-        self.artifacts = artifacts
-        self.vault = vault
+        self.audit = audit
+        self.artifacts = artifacts_store
+        self.redactor = redactor
 
-    def record_text(
+    def from_tool_result(
         self,
-        *,
+        engagement: Engagement,
         task_id: str,
-        asset_revision: str,
+        asset_id: str,
+        asset_binding_digest: str,
+        tool: ToolManifest,
+        tool_run_id: str,
+        result: ToolResult,
+        *,
         evidence_type: str,
-        evidence_class: str,
-        text: str,
-        classification: DataClassification,
-        source_session_id: str | None = None,
-        payload: dict[str, Any] | None = None,
-    ) -> tuple[EvidenceRecord, ModelContent]:
-        artifact_digest = self.artifacts.persist(text.encode(), media_type="text/plain")
-        model_content = prepare_for_model(classification, text)
-        vault_refs = [
-            self.vault.store(candidate.kind, candidate.fingerprint, candidate.value)
-            for candidate in model_content.vault_candidates
-        ]
-        record = EvidenceRecord(
-            evidence_id=f"E-{uuid.uuid4().hex}",
+        summary: str,
+        excerpt_limit: int = 20_000,
+    ) -> EvidenceEnvelope:
+        raw = canonical_bytes(result)
+        artifact = self.artifacts.put(
+            engagement.engagement_id,
+            raw,
+            "application/json",
+            tool_run_id=tool_run_id,
+        )
+        visible_source = json.dumps(result.structured, ensure_ascii=False, sort_keys=True)
+        if result.stdout:
+            visible_source += "\n" + result.stdout
+        if result.stderr:
+            visible_source += "\n" + result.stderr
+        visible_source = visible_source[:excerpt_limit]
+        redacted, secret_refs = self.redactor.redact(
+            engagement.engagement_id,
+            visible_source,
+            redact_pii=engagement.data_policy.redact_pii_before_model,
+        )
+        envelope = EvidenceEnvelope(
+            evidence_id=new_id("EVID"),
+            engagement_id=engagement.engagement_id,
+            engagement_revision=engagement.revision,
             task_id=task_id,
-            asset_revision=asset_revision,
+            asset_id=asset_id,
+            asset_binding_digest=asset_binding_digest,
+            tool_template_id=tool.template_id,
+            tool_manifest_digest=sha256_digest(tool),
+            tool_run_id=tool_run_id,
+            artifact_digest=artifact.digest,
             evidence_type=evidence_type,
-            evidence_class=evidence_class,
-            payload={
-                **(payload or {}),
-                "model_text": model_content.text,
-                "classification": classification.value,
-                "redaction_count": model_content.redaction_count,
-                "vault_refs": vault_refs,
-            },
-            artifact_sha256=artifact_digest,
-            source_session_id=source_session_id,
+            summary=summary,
+            excerpt=redacted,
+            secret_refs=secret_refs,
+            content_hash=sha256_digest(
+                {
+                    "artifact": artifact.digest,
+                    "summary": summary,
+                    "excerpt": redacted,
+                    "provenance": {
+                        "tool": tool.template_id,
+                        "tool_run_id": tool_run_id,
+                        "asset_binding_digest": asset_binding_digest,
+                    },
+                }
+            ),
             created_at=datetime.now(timezone.utc),
+            provenance={
+                "tool_template_id": tool.template_id,
+                "tool_manifest_digest": sha256_digest(tool),
+                "tool_run_id": tool_run_id,
+                "asset_id": asset_id,
+                "asset_binding_digest": asset_binding_digest,
+                "artifact_digest": artifact.digest,
+            },
         )
         with self.database.transaction() as connection:
             connection.execute(
-                "INSERT INTO evidence "
-                "(evidence_id, task_id, asset_revision, evidence_type, evidence_class, "
-                "payload_json, artifact_sha256, source_session_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    record.evidence_id,
-                    record.task_id,
-                    record.asset_revision,
-                    record.evidence_type,
-                    record.evidence_class,
-                    canonical_json(record.payload),
-                    record.artifact_sha256,
-                    record.source_session_id,
-                    record.created_at.isoformat(),
-                ),
+                insert(evidence).values(
+                    evidence_id=envelope.evidence_id,
+                    engagement_id=envelope.engagement_id,
+                    task_id=envelope.task_id,
+                    asset_id=envelope.asset_id,
+                    content_hash=envelope.content_hash,
+                    evidence_json=envelope.model_dump_json(),
+                    created_at=envelope.created_at,
+                )
             )
-        return record, model_content
+            self.audit.append(
+                engagement.engagement_id,
+                "evidence.recorded",
+                {
+                    "evidence_id": envelope.evidence_id,
+                    "evidence_type": evidence_type,
+                    "content_hash": envelope.content_hash,
+                    "artifact_digest": artifact.digest,
+                    "secret_ref_count": len(secret_refs),
+                },
+                connection=connection,
+            )
+        return envelope
 
-    def for_task(self, task_id: str) -> list[EvidenceRecord]:
+    def get(self, evidence_id: str) -> EvidenceEnvelope:
+        row = self.database.fetch_one(select(evidence).where(evidence.c.evidence_id == evidence_id))
+        if row is None:
+            raise KeyError(evidence_id)
+        return EvidenceEnvelope.model_validate_json(str(row["evidence_json"]))
+
+    def list_for_task(self, task_id: str) -> list[EvidenceEnvelope]:
         rows = self.database.fetch_all(
-            "SELECT * FROM evidence WHERE task_id = ? ORDER BY created_at", (task_id,)
+            select(evidence.c.evidence_json)
+            .where(evidence.c.task_id == task_id)
+            .order_by(evidence.c.created_at.asc())
         )
-        return [
-            EvidenceRecord(
-                evidence_id=row["evidence_id"],
-                task_id=row["task_id"],
-                asset_revision=row["asset_revision"],
-                evidence_type=row["evidence_type"],
-                evidence_class=row["evidence_class"],
-                payload=json.loads(row["payload_json"]),
-                artifact_sha256=row["artifact_sha256"],
-                source_session_id=row["source_session_id"],
-                created_at=datetime.fromisoformat(row["created_at"]),
-            )
-            for row in rows
-        ]
-
-
-@dataclass(frozen=True)
-class EvidencePolicy:
-    required_evidence: frozenset[str]
-    minimum_evidence_classes: int
-    deterministic_oracle: str
-
-    def evaluate(
-        self,
-        evidence: list[EvidenceRecord],
-        oracle_result: bool | None,
-        blind_verification: VerificationResult,
-    ) -> tuple[bool, tuple[str, ...]]:
-        types = {item.evidence_type for item in evidence}
-        classes = {item.evidence_class for item in evidence}
-        missing = tuple(sorted(self.required_evidence - types))
-        accepted = (
-            not missing
-            and len(classes) >= self.minimum_evidence_classes
-            and oracle_result is True
-            and blind_verification.verdict == "confirmed"
-            and blind_verification.claim_supported
-            and blind_verification.impact_supported
-        )
-        return accepted, missing
-
-
-EVIDENCE_POLICIES: dict[str, EvidencePolicy] = {
-    "authorization_inconsistency": EvidencePolicy(
-        required_evidence=frozenset(
-            {"source_location", "route_to_handler", "missing_enforcement", "counterevidence_search"}
-        ),
-        minimum_evidence_classes=2,
-        deterministic_oracle="route_trace_verifier",
-    ),
-    "dependency_advisory": EvidencePolicy(
-        required_evidence=frozenset(
-            {"dependency_record", "advisory_record", "version_match", "counterevidence_search"}
-        ),
-        minimum_evidence_classes=2,
-        deterministic_oracle="version_range_checker",
-    ),
-    "secret_exposure": EvidencePolicy(
-        required_evidence=frozenset(
-            {"source_location", "secret_pattern_match", "vault_confirmation", "counterevidence_search"}
-        ),
-        minimum_evidence_classes=2,
-        deterministic_oracle="vault_cross_checker",
-    ),
-}
-
-
-class Oracle(Protocol):
-    def __call__(self, evidence: list[EvidenceRecord]) -> bool:
-        ...
-
-
-def route_trace_verifier(evidence: list[EvidenceRecord]) -> bool:
-    types = {item.evidence_type for item in evidence}
-    return {"route_to_handler", "missing_enforcement"}.issubset(types)
-
-
-def version_range_checker(evidence: list[EvidenceRecord]) -> bool:
-    return any(
-        item.evidence_type == "version_match" and item.payload.get("matched") is True
-        for item in evidence
-    )
-
-
-def vault_cross_checker(evidence: list[EvidenceRecord]) -> bool:
-    vault_refs = {
-        reference
-        for item in evidence
-        for reference in item.payload.get("vault_refs", [])
-        if isinstance(reference, str)
-    }
-    return bool(vault_refs) and any(
-        item.evidence_type == "vault_confirmation" for item in evidence
-    )
-
-
-ORACLES: dict[str, Oracle] = {
-    "route_trace_verifier": route_trace_verifier,
-    "version_range_checker": version_range_checker,
-    "vault_cross_checker": vault_cross_checker,
-}
+        return [EvidenceEnvelope.model_validate_json(str(row["evidence_json"])) for row in rows]

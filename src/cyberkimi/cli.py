@@ -1,39 +1,72 @@
+"""CyberKimi command-line interface."""
+
 from __future__ import annotations
 
+import getpass
 import json
-import os
-import platform
-import sys
+import shutil
 from pathlib import Path
 from typing import Annotated
 
 import typer
+import yaml
 
-from . import __version__
-from .domain import DataClassification
-from .manifest import load_manifest, provision_repository_manifest, write_manifest
-from .orchestrator import CyberKimi
-
+from cyberkimi import __version__
+from cyberkimi.config import Settings
+from cyberkimi.errors import CyberKimiError
+from cyberkimi.ids import new_id
+from cyberkimi.models import DataClassification, HealthReport
+from cyberkimi.runtime import Runtime, build_runtime
 
 app = typer.Typer(
     name="cyberkimi",
-    help="Evidence-first security analysis harness for authorized engagements.",
     no_args_is_help=True,
+    invoke_without_command=True,
+    help="Authorization-bound, evidence-first local security analysis.",
 )
-engagement_app = typer.Typer(help="Provision, validate, and register engagement manifests.")
+engagement_app = typer.Typer(no_args_is_help=True, help="Manage immutable engagement revisions.")
 app.add_typer(engagement_app, name="engagement")
 
 StateOption = Annotated[
     Path,
-    typer.Option("--state-directory", "-s", help="Trusted local CyberKimi state directory."),
+    typer.Option(
+        "--state-directory",
+        envvar="CYBERKIMI_STATE_DIR",
+        help="CyberKimi local state directory.",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+    ),
 ]
 
 
+def _runtime(state_directory: Path) -> Runtime:
+    return build_runtime(Settings.from_env(state_directory))
+
+
+def _emit(value: object, *, json_output: bool = False) -> None:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json", exclude_none=True)  # type: ignore[union-attr]
+    if json_output:
+        typer.echo(json.dumps(value, indent=2, sort_keys=True, default=str))
+    else:
+        typer.echo(yaml.safe_dump(value, sort_keys=False).rstrip())
+
+
+def _fatal(exc: Exception) -> None:
+    typer.echo(f"error: {exc}", err=True)
+    raise typer.Exit(code=2) from exc
+
+
 @app.callback()
-def root(
+def main(
     version: Annotated[
         bool,
-        typer.Option("--version", help="Print the CyberKimi version and exit."),
+        typer.Option(
+            "--version",
+            help="Show the installed CyberKimi version and exit.",
+            is_eager=True,
+        ),
     ] = False,
 ) -> None:
     if version:
@@ -43,124 +76,168 @@ def root(
 
 @app.command("init")
 def initialize(state_directory: StateOption = Path(".cyberkimi")) -> None:
-    instance = CyberKimi(state_directory)
-    typer.echo(f"Initialized CyberKimi state at {instance.paths.root}")
+    """Initialize state, signing keys, vault key, database, and default tools."""
 
-
-@engagement_app.command("provision")
-def provision(
-    target: Annotated[Path, typer.Option("--target", exists=True, file_okay=False)],
-    owner: Annotated[str, typer.Option("--owner")],
-    output: Annotated[Path, typer.Option("--output", "-o")] = Path("engagement.yaml"),
-    classification: Annotated[
-        DataClassification,
-        typer.Option("--data-classification", case_sensitive=False),
-    ] = DataClassification.INTERNAL,
-) -> None:
-    manifest = provision_repository_manifest(
-        target,
-        owner=owner,
-        classification=classification,
-    )
-    write_manifest(manifest, output)
-    typer.echo(f"Wrote {manifest.engagement_id} to {output}")
-
-
-@engagement_app.command("validate")
-def validate_manifest(path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)]) -> None:
-    manifest = load_manifest(path)
-    typer.echo(
-        json.dumps(
-            {
-                "valid": True,
-                "engagement_id": manifest.engagement_id,
-                "revision": manifest.revision,
-                "assets": [asset.id for asset in manifest.assets],
-            },
-            indent=2,
-        )
-    )
-
-
-@engagement_app.command("create")
-def create_engagement(
-    path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
-    state_directory: StateOption = Path(".cyberkimi"),
-) -> None:
-    instance = CyberKimi(state_directory)
-    assets = instance.register_manifest_file(path)
-    typer.echo(
-        json.dumps(
-            {
-                "registered": True,
-                "manifest": str(path),
-                "asset_revisions": assets,
-            },
-            indent=2,
-        )
-    )
-
-
-@app.command("review")
-def review(
-    asset_id: Annotated[str, typer.Argument(help="Registered repository asset alias or revision.")],
-    engagement_id: Annotated[str, typer.Option("--engagement", "-e")],
-    goal: Annotated[str, typer.Option("--goal", "-g")],
-    state_directory: StateOption = Path(".cyberkimi"),
-) -> None:
-    instance = CyberKimi(state_directory)
-    result = instance.review_repository(
-        engagement_id=engagement_id,
-        asset_id=asset_id,
-        goal=goal,
-    )
-    typer.echo(
-        json.dumps(
-            {
-                "task_id": result.task_id,
-                "asset_revision": result.asset_revision,
-                "files": result.file_count,
-                "dependencies": result.dependency_count,
-                "secret_signals": result.secret_signal_count,
-                "confirmed_findings": result.confirmed_finding_count,
-                "unresolved_findings": result.unresolved_finding_count,
-                "report": str(result.report_path),
-            },
-            indent=2,
-        )
-    )
+    try:
+        runtime = _runtime(state_directory)
+        typer.echo(f"initialized CyberKimi state at {runtime.settings.state_directory}")
+    except (CyberKimiError, OSError, ValueError) as exc:
+        _fatal(exc)
 
 
 @app.command("doctor")
-def doctor(state_directory: StateOption = Path(".cyberkimi")) -> None:
-    checks: dict[str, object] = {
-        "python": platform.python_version(),
-        "python_supported": sys.version_info >= (3, 12),
-        "state_directory": str(state_directory.expanduser().resolve()),
-        "moonshot_key_configured": bool(os.getenv("MOONSHOT_API_KEY")),
-        "control_plane_secret_leak_candidates": sorted(
-            key
-            for key in os.environ
-            if key.startswith("CYBERKIMI_TOOL_")
-            and any(marker in key.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
-        ),
-    }
+def doctor(
+    state_directory: StateOption = Path(".cyberkimi"),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Verify local state and optional deterministic scanner availability."""
+
     try:
-        instance = CyberKimi(state_directory)
-        instance.database.fetch_one("SELECT 1 AS healthy")
-        checks["state_initialized"] = True
-        checks["database_healthy"] = True
-    except Exception as exc:  # pragma: no cover - command reports diagnostics by design
-        checks["state_initialized"] = False
-        checks["database_healthy"] = False
-        checks["error"] = str(exc)
-    healthy = bool(checks["python_supported"]) and bool(checks.get("database_healthy")) and not checks[
-        "control_plane_secret_leak_candidates"
-    ]
-    checks["healthy"] = healthy
-    typer.echo(json.dumps(checks, indent=2, sort_keys=True))
-    if not healthy:
-        raise typer.Exit(code=1)
+        runtime = _runtime(state_directory)
+        signing_key_ok = runtime.settings.scope_public_key_path.exists()
+        vault_key_ok = runtime.settings.vault_key_path.exists()
+        audit_chain_ok = True
+        report = HealthReport(
+            state_directory=str(runtime.settings.state_directory),
+            database_ok=runtime.database.ping(),
+            signing_key_ok=signing_key_ok,
+            vault_key_ok=vault_key_ok,
+            audit_chain_ok=audit_chain_ok,
+            optional_tools={
+                name: shutil.which(binary) is not None
+                for name, binary in {
+                    "semgrep": "semgrep",
+                    "gitleaks": "gitleaks",
+                    "osv-scanner": "osv-scanner",
+                    "syft": "syft",
+                    "docker": "docker",
+                    "tshark": "tshark",
+                }.items()
+            },
+        )
+        _emit(report, json_output=json_output)
+        if not all(
+            (report.database_ok, report.signing_key_ok, report.vault_key_ok, report.audit_chain_ok)
+        ):
+            raise typer.Exit(code=1)
+    except (CyberKimiError, OSError, ValueError) as exc:
+        _fatal(exc)
+
+
+@engagement_app.command("draft")
+def engagement_draft(
+    local_repo: Annotated[Path, typer.Option("--local-repo", exists=True, resolve_path=True)],
+    output: Annotated[Path, typer.Option("--output")] = Path("engagement.yaml"),
+    state_directory: StateOption = Path(".cyberkimi"),
+    engagement_id: Annotated[str | None, typer.Option("--engagement-id")] = None,
+    name: Annotated[str | None, typer.Option("--name")] = None,
+    owner_id: Annotated[str | None, typer.Option("--owner-id")] = None,
+    classification: Annotated[DataClassification, typer.Option("--classification")] = (
+        DataClassification.INTERNAL
+    ),
+    external_model: Annotated[bool, typer.Option("--external-model/--no-external-model")] = False,
+) -> None:
+    """Create a local draft; drafting does not authorize execution."""
+
+    try:
+        runtime = _runtime(state_directory)
+        draft = runtime.engagements.draft_local(
+            local_repo,
+            engagement_id=engagement_id or new_id("ENG"),
+            name=name or local_repo.name,
+            owner_id=owner_id or f"user:{getpass.getuser()}",
+            classification=classification,
+            external_model_allowed=external_model,
+        )
+        runtime.engagements.write_manifest(draft, output)
+        typer.echo(str(output.resolve()))
+    except (CyberKimiError, OSError, ValueError) as exc:
+        _fatal(exc)
+
+
+@engagement_app.command("validate")
+def engagement_validate(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False, resolve_path=True)],
+    state_directory: StateOption = Path(".cyberkimi"),
+) -> None:
+    """Validate a manifest and print its canonical digest without registering it."""
+
+    try:
+        runtime = _runtime(state_directory)
+        engagement = runtime.engagements.load_manifest(manifest)
+        typer.echo(runtime.engagements.validate(engagement))
+    except (CyberKimiError, OSError, ValueError) as exc:
+        _fatal(exc)
+
+
+@engagement_app.command("create")
+def engagement_create(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False, resolve_path=True)],
+    state_directory: StateOption = Path(".cyberkimi"),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Validate, sign, and register engagement revision one."""
+
+    try:
+        runtime = _runtime(state_directory)
+        engagement = runtime.engagements.load_manifest(manifest)
+        active, signature = runtime.engagements.create(engagement)
+        _emit(
+            {
+                "engagement": active.model_dump(mode="json", exclude_none=True),
+                "signature": signature,
+            },
+            json_output=json_output,
+        )
+    except (CyberKimiError, OSError, ValueError) as exc:
+        _fatal(exc)
+
+
+@engagement_app.command("show")
+def engagement_show(
+    engagement_id: Annotated[str, typer.Argument()],
+    revision: Annotated[int, typer.Option("--revision", min=1)],
+    state_directory: StateOption = Path(".cyberkimi"),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        runtime = _runtime(state_directory)
+        _emit(runtime.engagements.get(engagement_id, revision), json_output=json_output)
+    except (CyberKimiError, KeyError, OSError, ValueError) as exc:
+        _fatal(exc)
+
+
+@engagement_app.command("amend")
+def engagement_amend(
+    engagement_id: Annotated[str, typer.Argument()],
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False, resolve_path=True)],
+    state_directory: StateOption = Path(".cyberkimi"),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        runtime = _runtime(state_directory)
+        replacement = runtime.engagements.load_manifest(manifest)
+        active, signature = runtime.engagements.amend(engagement_id, replacement)
+        _emit(
+            {"engagement": active.model_dump(mode="json"), "signature": signature},
+            json_output=json_output,
+        )
+    except (CyberKimiError, KeyError, OSError, ValueError) as exc:
+        _fatal(exc)
+
+
+@engagement_app.command("revoke")
+def engagement_revoke(
+    engagement_id: Annotated[str, typer.Argument()],
+    revision: Annotated[int, typer.Option("--revision", min=1)],
+    state_directory: StateOption = Path(".cyberkimi"),
+) -> None:
+    try:
+        runtime = _runtime(state_directory)
+        runtime.engagements.revoke(engagement_id, revision)
+        typer.echo(f"revoked {engagement_id}@{revision}")
+    except (CyberKimiError, KeyError, OSError, ValueError) as exc:
+        _fatal(exc)
 
 
 if __name__ == "__main__":
