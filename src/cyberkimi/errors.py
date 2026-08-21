@@ -1,30 +1,45 @@
+"""Typed CyberKimi exceptions."""
+
+
 class CyberKimiError(Exception):
-    """Base exception."""
+    """Base error for user-visible CyberKimi failures."""
 
 
 class ValidationFailure(CyberKimiError):
-    pass
+    """Input failed a local validation boundary."""
 
 
 class AuthorizationError(CyberKimiError):
-    pass
+    """Authorization could not be established or verified."""
 
 
-class ScopeTokenError(AuthorizationError):
-    pass
+class PolicyDenied(CyberKimiError):
+    """A proposed action was denied by immutable policy."""
 
 
-class ApprovalError(AuthorizationError):
-    pass
+class ApprovalRequired(CyberKimiError):
+    """An exact action approval is required."""
 
 
-class BudgetExceeded(AuthorizationError):
-    pass
+class GrantError(CyberKimiError):
+    """Execution grant validation or consumption failed."""
 
 
-class ToolExecutionError(CyberKimiError):
-    pass
+class AuditWriteError(CyberKimiError):
+    """Audit persistence failed; execution must fail closed."""
 
 
-class ProviderBoundaryError(CyberKimiError):
-    pass
+class ToolUnavailable(CyberKimiError):
+    """A pinned external adapter is not installed or usable."""
+
+
+class ProviderBoundary(CyberKimiError):
+    """The model provider declined the request on policy grounds."""
+
+
+class BudgetExceeded(CyberKimiError):
+    """A hard task or execution budget would be exceeded."""
+
+
+class DataPolicyError(CyberKimiError):
+    """External data exposure is blocked by the immutable engagement policy."""

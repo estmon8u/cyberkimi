@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling>=1.27"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=80", "wheel>=0.45"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "cyberkimi"
@@ -13,10 +13,7 @@ authors = [{name = "Esteban Montelongo"}]
 dependencies = [
   "cryptography>=45,<48",
   "httpx>=0.28,<1",
-  "jinja2>=3.1,<4",
   "jsonschema>=4.23,<5",
-  "openai>=2.0,<3",
-  "packaging>=24,<27",
   "pydantic>=2.10,<3",
   "pyyaml>=6,<7",
   "sqlalchemy>=2.0,<3",
@@ -25,24 +22,32 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8,<10",
-  "pytest-asyncio>=0.25,<2",
-  "pytest-cov>=6,<8",
-  "ruff>=0.11,<1",
+  "build>=1.2,<2",
   "mypy>=1.15,<2",
+  "pytest>=8,<10",
+  "pytest-cov>=6,<8",
+  "pytest-asyncio>=1.0,<2",
+  "ruff>=0.11,<1",
+  "types-PyYAML>=6.0,<7",
 ]
-docker = ["docker>=7,<8"]
+hunt = ["duckdb>=1.1,<2"]
 
 [project.scripts]
 cyberkimi = "cyberkimi.cli:app"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/cyberkimi"]
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers --strict-config"
 testpaths = ["tests"]
-asyncio_mode = "auto"
+markers = [
+  "integration: integration boundary tests",
+  "adversarial: abuse and prompt-injection tests",
+]
 
 [tool.ruff]
 target-version = "py312"
@@ -52,7 +57,20 @@ line-length = 100
 select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
 packages = ["cyberkimi"]
+plugins = ["pydantic.mypy"]
+warn_unused_ignores = true
+
+[tool.coverage.run]
+branch = true
+source = ["cyberkimi"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true

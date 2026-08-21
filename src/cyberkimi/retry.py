@@ -1,201 +1,176 @@
+"""Bounded retry classification and provider-boundary handling."""
+
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import re
+import hmac
+import random
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
+from typing import TypeVar
 
-from .domain import TaskState
-from .store import canonical_json
+import httpx
+from pydantic import Field
+
+from cyberkimi.models import StrictModel
+
+T = TypeVar("T")
 
 
 class NonResponseCategory(StrEnum):
-    HTTP_ERROR = "HTTP_ERROR"
+    HTTP_TRANSIENT = "HTTP_TRANSIENT"
     RATE_LIMIT = "RATE_LIMIT"
-    TOOL_SCHEMA_ERROR = "TOOL_SCHEMA_ERROR"
-    TOOL_CALL_ID_ERROR = "TOOL_CALL_ID_ERROR"
-    CONTEXT_FORMAT_ERROR = "CONTEXT_FORMAT_ERROR"
     TIMEOUT = "TIMEOUT"
-    MISSING_AUTH_CONTEXT = "MISSING_AUTH_CONTEXT"
-    AMBIGUOUS_TARGET = "AMBIGUOUS_TARGET"
-    ACTIVE_ACTION_REQUIRES_ENV = "ACTIVE_ACTION_REQUIRES_ENV"
-    APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
+    CONNECTION_RESET = "CONNECTION_RESET"
+    TOOL_CALL_ID_MISMATCH = "TOOL_CALL_ID_MISMATCH"
+    MESSAGE_HISTORY_ERROR = "MESSAGE_HISTORY_ERROR"
+    TOOL_SCHEMA_ERROR = "TOOL_SCHEMA_ERROR"
+    STRUCTURED_OUTPUT_INVALID = "STRUCTURED_OUTPUT_INVALID"
+    CONTEXT_LIMIT = "CONTEXT_LIMIT"
     CONTEXT_TOO_BROAD = "CONTEXT_TOO_BROAD"
+    MISSING_SCOPE = "MISSING_SCOPE"
+    MISSING_APPROVAL = "MISSING_APPROVAL"
+    DATA_POLICY_BLOCK = "DATA_POLICY_BLOCK"
     MODEL_REFUSAL = "MODEL_REFUSAL"
     PROVIDER_POLICY = "PROVIDER_POLICY"
-    UNKNOWN = "UNKNOWN"
+    NO_PROGRESS = "NO_PROGRESS"
+    PERMANENT = "PERMANENT"
 
 
-class RetryStrategy(StrEnum):
-    TECHNICAL_RETRY = "technical_retry"
-    AUTHORIZATION_CLARIFICATION = "authorization_clarification"
-    ASSET_CANONICALIZATION = "asset_canonicalization"
-    ENVIRONMENT_CONFIGURATION = "environment_configuration"
-    APPROVAL_RESOLUTION = "approval_resolution"
-    CONTEXT_NARROWING = "context_narrowing"
-    TERMINAL_QUESTION = "terminal_question"
-    SESSION_DECOMPOSITION = "session_decomposition"
-    DETERMINISTIC_INVESTIGATION = "deterministic_investigation"
-    EXHAUSTED = "exhausted"
-
-
-@dataclass(frozen=True)
-class RetryOutcome:
-    retry: bool
-    strategy: RetryStrategy
-    task_state: TaskState
-    fresh_session: bool
-    include_original_triggering_context: bool
-    reason: str
-
-
-@dataclass(frozen=True)
-class NonResponseEvent:
+class NonResponseEvent(StrictModel):
+    event_id: str
+    task_id: str
+    subtask_id: str | None = None
+    stage: str
     category: NonResponseCategory
-    subtype: str
-    status_code: int | None = None
-    provider_code: str | None = None
-    body: str = ""
+    retryable: bool
+    retry_count: int = Field(ge=0)
+    prompt_fingerprint: str
+    response_fingerprint: str
+    model: str
+    provider: str
+    resulting_state: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-class RetryManager:
-    """Bounded recovery without unbounded or disguise-based rephrasing.
+class ProviderBoundaryError(RuntimeError):
+    """A semantic or provider-policy boundary that must not be reframed or retried."""
 
-    Provider-boundary passes progressively ask narrower, independently valid
-    questions or fall back to deterministic evidence collection. The manager
-    never changes scope, target authorization, effects, or execution policy.
-    """
+    def __init__(self, message: str, category: NonResponseCategory):
+        super().__init__(message)
+        self.category = category
 
-    PROVIDER_ESCALATION: tuple[RetryStrategy, ...] = (
-        RetryStrategy.TECHNICAL_RETRY,
-        RetryStrategy.CONTEXT_NARROWING,
-        RetryStrategy.TERMINAL_QUESTION,
-        RetryStrategy.SESSION_DECOMPOSITION,
-        RetryStrategy.DETERMINISTIC_INVESTIGATION,
-    )
 
-    def __init__(self, maximum_attempts: int) -> None:
-        if maximum_attempts < 0:
-            raise ValueError("maximum_attempts cannot be negative")
-        self.maximum_attempts = maximum_attempts
+class StructuredOutputError(RuntimeError):
+    """The provider returned data that does not satisfy the requested schema."""
 
-    @staticmethod
-    def classify(
+
+@dataclass(frozen=True)
+class RetryLimits:
+    transport_retries: int = 3
+    schema_retries: int = 1
+    history_retries: int = 1
+    context_recompositions: int = 1
+    provider_policy_retries: int = 0
+    repeated_action_signature: int = 2
+    no_progress_rounds: int = 2
+
+
+@dataclass
+class RetryState:
+    transport: int = 0
+    schema: int = 0
+    history: int = 0
+    context: int = 0
+
+
+def keyed_fingerprint(key: bytes, value: str) -> str:
+    digest = hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"hmac-sha256:{digest}"
+
+
+def classify_exception(exc: BaseException) -> NonResponseCategory:
+    if isinstance(exc, ProviderBoundaryError):
+        return exc.category
+    if isinstance(exc, StructuredOutputError):
+        return NonResponseCategory.STRUCTURED_OUTPUT_INVALID
+    if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError)):
+        return NonResponseCategory.TIMEOUT
+    if isinstance(exc, (httpx.ConnectError, httpx.ReadError, ConnectionResetError)):
+        return NonResponseCategory.CONNECTION_RESET
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 429:
+            return NonResponseCategory.RATE_LIMIT
+        if status in {408, 425, 500, 502, 503, 504}:
+            return NonResponseCategory.HTTP_TRANSIENT
+        return NonResponseCategory.PERMANENT
+    return NonResponseCategory.PERMANENT
+
+
+def provider_error_category(status_code: int, error: object) -> NonResponseCategory:
+    """Classify one provider error without attempting semantic workarounds."""
+
+    text = str(error).lower()
+    if status_code == 429:
+        return NonResponseCategory.RATE_LIMIT
+    if status_code in {408, 425, 500, 502, 503, 504}:
+        return NonResponseCategory.HTTP_TRANSIENT
+    if "context" in text and any(token in text for token in ("length", "limit", "window")):
+        return NonResponseCategory.CONTEXT_LIMIT
+    if any(token in text for token in ("policy", "safety", "not allowed", "prohibited")):
+        return NonResponseCategory.PROVIDER_POLICY
+    if any(token in text for token in ("refus", "cannot assist", "can't assist")):
+        return NonResponseCategory.MODEL_REFUSAL
+    return NonResponseCategory.PERMANENT
+
+
+class RetryController:
+    """Retry only transport-equivalent work and one strict schema repair."""
+
+    def __init__(self, limits: RetryLimits = RetryLimits(), *, base_delay: float = 0.25):
+        self.limits = limits
+        self.base_delay = base_delay
+
+    async def run(
+        self,
+        operation: Callable[[], Awaitable[T]],
         *,
-        status_code: int | None,
-        provider_code: str | None,
-        body: str,
-    ) -> NonResponseEvent:
-        lowered = body.lower()
-        if status_code == 429:
-            category = NonResponseCategory.RATE_LIMIT
-        elif status_code is not None and status_code >= 500:
-            category = NonResponseCategory.HTTP_ERROR
-        elif "tool_call_id" in lowered:
-            category = NonResponseCategory.TOOL_CALL_ID_ERROR
-        elif "json schema" in lowered or "schema" in lowered and "invalid" in lowered:
-            category = NonResponseCategory.TOOL_SCHEMA_ERROR
-        elif "context length" in lowered or "too many tokens" in lowered:
-            category = NonResponseCategory.CONTEXT_TOO_BROAD
-        elif "timeout" in lowered:
-            category = NonResponseCategory.TIMEOUT
-        elif provider_code and provider_code.upper() in {"CONTENT_POLICY", "SAFETY", "POLICY"}:
-            category = NonResponseCategory.PROVIDER_POLICY
-        elif re.search(r"\b(cannot|can't|unable to) (help|assist|comply)\b", lowered):
-            category = NonResponseCategory.MODEL_REFUSAL
-        elif "authorization" in lowered and "missing" in lowered:
-            category = NonResponseCategory.MISSING_AUTH_CONTEXT
-        elif "target" in lowered and ("ambiguous" in lowered or "unknown" in lowered):
-            category = NonResponseCategory.AMBIGUOUS_TARGET
-        else:
-            category = NonResponseCategory.UNKNOWN
-        return NonResponseEvent(
-            category=category,
-            subtype=provider_code or "UNSPECIFIED",
-            status_code=status_code,
-            provider_code=provider_code,
-            body=body,
-        )
-
-    def next_outcome(self, event: NonResponseEvent, *, attempt: int) -> RetryOutcome:
-        if attempt >= self.maximum_attempts:
-            return RetryOutcome(
-                retry=False,
-                strategy=RetryStrategy.EXHAUSTED,
-                task_state=TaskState.PROVIDER_BOUNDARY_EXHAUSTED
-                if event.category == NonResponseCategory.PROVIDER_POLICY
-                else TaskState.FAILED,
-                fresh_session=False,
-                include_original_triggering_context=False,
-                reason="configured retry budget exhausted",
-            )
-        if event.category in {
-            NonResponseCategory.HTTP_ERROR,
-            NonResponseCategory.RATE_LIMIT,
-            NonResponseCategory.TOOL_SCHEMA_ERROR,
-            NonResponseCategory.TOOL_CALL_ID_ERROR,
-            NonResponseCategory.CONTEXT_FORMAT_ERROR,
-            NonResponseCategory.TIMEOUT,
-        }:
-            return RetryOutcome(
-                retry=True,
-                strategy=RetryStrategy.TECHNICAL_RETRY,
-                task_state=TaskState.READY,
-                fresh_session=False,
-                include_original_triggering_context=True,
-                reason="retry exact semantic request after repairing technical failure",
-            )
-        if event.category == NonResponseCategory.MISSING_AUTH_CONTEXT:
-            return RetryOutcome(
-                retry=True,
-                strategy=RetryStrategy.AUTHORIZATION_CLARIFICATION,
-                task_state=TaskState.NEEDS_AUTHORIZATION,
-                fresh_session=True,
-                include_original_triggering_context=True,
-                reason="attach signed engagement summary without changing requested scope",
-            )
-        if event.category == NonResponseCategory.AMBIGUOUS_TARGET:
-            return RetryOutcome(
-                retry=True,
-                strategy=RetryStrategy.ASSET_CANONICALIZATION,
-                task_state=TaskState.NEEDS_SCOPE,
-                fresh_session=True,
-                include_original_triggering_context=True,
-                reason="replace ambiguous target text with registered asset identifiers",
-            )
-        if event.category == NonResponseCategory.APPROVAL_REQUIRED:
-            return RetryOutcome(
-                retry=True,
-                strategy=RetryStrategy.APPROVAL_RESOLUTION,
-                task_state=TaskState.HUMAN_APPROVAL_REQUIRED,
-                fresh_session=False,
-                include_original_triggering_context=True,
-                reason="resolve approval through policy engine",
-            )
-        if event.category == NonResponseCategory.PROVIDER_POLICY:
-            index = min(attempt, len(self.PROVIDER_ESCALATION) - 1)
-            strategy = self.PROVIDER_ESCALATION[index]
-            return RetryOutcome(
-                retry=True,
-                strategy=strategy,
-                task_state=TaskState.PROVIDER_BOUNDARY,
-                fresh_session=index >= 1,
-                include_original_triggering_context=index < 2,
-                reason=(
-                    "bounded provider-boundary recovery; later passes receive only a newly "
-                    "compiled, independently valid sub-question and normalized evidence"
-                ),
-            )
-        return RetryOutcome(
-            retry=True,
-            strategy=RetryStrategy.CONTEXT_NARROWING,
-            task_state=TaskState.READY,
-            fresh_session=True,
-            include_original_triggering_context=True,
-            reason="narrow task to its minimum evidence question",
-        )
-
-    @staticmethod
-    def fingerprint(payload: dict[str, Any]) -> str:
-        return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+        idempotent: bool = True,
+        on_retry: Callable[[NonResponseCategory, int], Awaitable[None] | None] | None = None,
+    ) -> T:
+        state = RetryState()
+        while True:
+            try:
+                return await operation()
+            except BaseException as exc:
+                category = classify_exception(exc)
+                retry_number: int | None = None
+                if category in {
+                    NonResponseCategory.HTTP_TRANSIENT,
+                    NonResponseCategory.RATE_LIMIT,
+                    NonResponseCategory.CONNECTION_RESET,
+                }:
+                    if state.transport < self.limits.transport_retries:
+                        state.transport += 1
+                        retry_number = state.transport
+                elif category is NonResponseCategory.TIMEOUT and idempotent:
+                    if state.transport < self.limits.transport_retries:
+                        state.transport += 1
+                        retry_number = state.transport
+                elif category is NonResponseCategory.STRUCTURED_OUTPUT_INVALID:
+                    if state.schema < self.limits.schema_retries:
+                        state.schema += 1
+                        retry_number = state.schema
+                if retry_number is None:
+                    raise
+                if on_retry is not None:
+                    maybe_awaitable = on_retry(category, retry_number)
+                    if maybe_awaitable is not None:
+                        await maybe_awaitable
+                delay = self.base_delay * (2 ** (retry_number - 1))
+                delay += random.uniform(0, max(delay * 0.25, 0.001))
+                await asyncio.sleep(delay)
