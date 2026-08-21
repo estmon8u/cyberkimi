@@ -31,9 +31,9 @@ jobs:
         run: |
           set -euo pipefail
           found="$(find bootstrap-full -maxdepth 1 -type f -name 'CyberKimiFull.bundle.b64.part-*' 2>/dev/null | wc -l | tr -d ' ')"
-          if [[ "$found" != '6' ]]; then
+          if [[ "$found" != '33' ]]; then
             echo 'ready=false' >> "$GITHUB_OUTPUT"
-            echo "Waiting for all transport segments: $found of 6"
+            echo "Waiting for all transport segments: $found of 33"
             exit 0
           fi
           echo 'ready=true' >> "$GITHUB_OUTPUT"
