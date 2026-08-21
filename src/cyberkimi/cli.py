@@ -18,7 +18,8 @@ from .orchestrator import CyberKimi
 app = typer.Typer(
     name="cyberkimi",
     help="Evidence-first security analysis harness for authorized engagements.",
-    no_args_is_help=True,
+    no_args_is_help=False,
+    invoke_without_command=True,
 )
 engagement_app = typer.Typer(help="Provision, validate, and register engagement manifests.")
 app.add_typer(engagement_app, name="engagement")
@@ -31,13 +32,17 @@ StateOption = Annotated[
 
 @app.callback()
 def root(
+    context: typer.Context,
     version: Annotated[
         bool,
-        typer.Option("--version", help="Print the CyberKimi version and exit."),
+        typer.Option("--version", help="Print the CyberKimi version and exit.", is_eager=True),
     ] = False,
 ) -> None:
     if version:
         typer.echo(__version__)
+        raise typer.Exit()
+    if context.invoked_subcommand is None:
+        typer.echo(context.get_help())
         raise typer.Exit()
 
 
