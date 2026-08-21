@@ -1,0 +1,58 @@
+name: Materialize CyberKimi completion source
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: materialize-cyberkimi-completion
+  cancel-in-progress: false
+
+jobs:
+  materialize:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'complete/cyberkimi-v0.1' && github.event.pull_request.head.sha == '11f42475f941c9bf233622920cd123381a649b71'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the exact completion transport commit
+        uses: actions/checkout@v4
+        with:
+          ref: 11f42475f941c9bf233622920cd123381a649b71
+          fetch-depth: 0
+
+      - name: Verify transport and extract tested source
+        shell: bash
+        run: |
+          set -euo pipefail
+          found="$(find transport -maxdepth 1 -type f -name 'source.tar.gz.b64.part-*' | wc -l | tr -d ' ')"
+          test "$found" = '8'
+          cat transport/source.tar.gz.b64.part-* | tr -d '\r\n\t ' | base64 --decode > /tmp/cyberkimi-source.tar.gz
+          echo 'e98828687e71805e5f4c4a12f18639e38865849c9dce691de375fc165476ca95  /tmp/cyberkimi-source.tar.gz' | sha256sum --check --strict
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          tar -xzf /tmp/cyberkimi-source.tar.gz -C .
+          rm -rf .state .pytest_cache
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f -name '*.pyc' -delete
+
+      - name: Verify the materialized source before commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          python -m compileall -q src tests
+          python -m pytest -q
+
+      - name: Commit actual source files to the completion branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: materialize tested CyberKimi control plane'
+          git push origin HEAD:complete/cyberkimi-v0.1
