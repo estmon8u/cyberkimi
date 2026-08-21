@@ -78,3 +78,5 @@ jobs:
           remote_sha="$(git ls-remote origin refs/heads/build/cyberkimi-v0.1 | cut -f1)"
           test "$remote_sha" = "$expected_sha"
           echo "Imported CyberKimi phase history at $remote_sha"
+
+# Retiggered for the completion audit on 2026-08-20.
