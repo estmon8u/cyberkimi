@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - build/cyberkimi-v0.1
+      - audit/cyberkimi-v0.1
   pull_request:
 
 permissions:
