@@ -1,0 +1,136 @@
+name: Restore canonical CyberKimi package tree
+
+on:
+  push:
+    branches:
+      - audit/cyberkimi-v0.1
+    paths:
+      - .github/workflows/restore-canonical.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: restore-canonical-cyberkimi
+  cancel-in-progress: false
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out verified bundle transport
+        uses: actions/checkout@v4
+        with:
+          ref: bootstrap/replay-cyberkimi-v0.1
+          fetch-depth: 0
+
+      - name: Reassemble and verify canonical bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t parts < <(awk '{print "bootstrap/" $2}' bootstrap/chunks.sha256)
+          test "${#parts[@]}" -eq 30
+          for part in "${parts[@]}"; do test -f "$part"; done
+          cat "${parts[@]}" | tr -d '\r\n\t ' > /tmp/CyberKimi.bundle.b64
+          echo 'fb3c7c9541d90783c954f3bbd209173606ba0c70e08f070c8aa80ff7f0aa3931  /tmp/CyberKimi.bundle.b64' | sha256sum --check --strict
+          base64 --decode /tmp/CyberKimi.bundle.b64 > /tmp/CyberKimi.bundle
+          echo '7c86859f3a1434c02024c0e6cf79679509e9d21cc4605f8dc2ae5b0dbd886fc0  /tmp/CyberKimi.bundle' | sha256sum --check --strict
+          git bundle verify /tmp/CyberKimi.bundle
+
+      - name: Build audited canonical merge commit
+        shell: bash
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          audit_sha="$GITHUB_SHA"
+          git fetch origin audit/cyberkimi-v0.1
+          test "$(git rev-parse FETCH_HEAD)" = "$audit_sha"
+          git show "$audit_sha:docs/implementation-audit.md" > /tmp/implementation-audit.md
+
+          git fetch /tmp/CyberKimi.bundle \
+            refs/heads/build/cyberkimi-v0.1:refs/remotes/canonical/build
+          canonical_sha="$(git rev-parse refs/remotes/canonical/build)"
+          test "$canonical_sha" = '40ceb56ab181175fd673d2966f5f6e019261d39e'
+
+          git checkout --detach "$canonical_sha"
+          mkdir -p .github/workflows docs
+          cp /tmp/implementation-audit.md docs/implementation-audit.md
+          cat > .github/workflows/ci.yml <<'YAML'
+          name: CI
+
+          on:
+            push:
+              branches:
+                - main
+                - audit/cyberkimi-v0.1
+            pull_request:
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: cyberkimi-${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
+
+          jobs:
+            test:
+              runs-on: ubuntu-latest
+              timeout-minutes: 20
+              strategy:
+                fail-fast: false
+                matrix:
+                  python-version: ["3.12", "3.13"]
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: ${{ matrix.python-version }}
+                    cache: pip
+                - name: Install
+                  run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
+                - name: Lint
+                  run: python -m ruff check src tests
+                - name: Test
+                  run: python -m pytest --cov=cyberkimi --cov-report=term-missing
+                - name: Compile
+                  run: python -m compileall -q src
+                - name: CLI smoke
+                  run: |
+                    cyberkimi --version
+                    CYBERKIMI_HOME="$PWD/.test-state" cyberkimi init
+                    CYBERKIMI_HOME="$PWD/.test-state" cyberkimi --help
+
+            build:
+              runs-on: ubuntu-latest
+              timeout-minutes: 10
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: "3.12"
+                - run: python -m pip install --upgrade pip build
+                - run: python -m build
+                - run: python -m pip install dist/*.whl
+                - run: cyberkimi --version
+                - uses: actions/upload-artifact@v4
+                  with:
+                    name: cyberkimi-distributions
+                    path: dist/*
+                    if-no-files-found: error
+          YAML
+
+          git add -- .github/workflows/ci.yml docs/implementation-audit.md
+          tree_sha="$(git write-tree)"
+          merge_sha="$(printf '%s\n\n%s\n' \
+            'refactor: restore canonical CyberKimi package architecture' \
+            'Replace the conflicting dual module/package tree with the exact locally verified phase history while retaining the implementation audit and CI gate.' \
+            | git commit-tree "$tree_sha" -p "$audit_sha" -p "$canonical_sha")"
+          git push origin "$merge_sha:refs/heads/audit/cyberkimi-v0.1" \
+            --force-with-lease=refs/heads/audit/cyberkimi-v0.1:"$audit_sha"
+          test "$(git ls-remote origin refs/heads/audit/cyberkimi-v0.1 | cut -f1)" = "$merge_sha"
+          echo "Restored audited canonical tree at $merge_sha"
