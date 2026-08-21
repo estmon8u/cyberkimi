@@ -6,7 +6,7 @@ on:
       - complete/cyberkimi-v0.1
     paths:
       - .github/workflows/materialize-source.yml
-      - transport/source.tar.gz.b64
+      - transport/source.tar.gz.b64.part-*
 
 permissions:
   contents: write
@@ -31,8 +31,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -f transport/source.tar.gz.b64 ]]; then
+          found="$(find transport -maxdepth 1 -type f -name 'source.tar.gz.b64.part-*' 2>/dev/null | wc -l | tr -d ' ')"
+          if [[ "$found" != '8' ]]; then
             echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo "Waiting for all transport segments: $found of 8"
             exit 0
           fi
           echo 'ready=true' >> "$GITHUB_OUTPUT"
@@ -42,7 +44,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tr -d '\r\n\t ' < transport/source.tar.gz.b64 | base64 --decode > /tmp/cyberkimi-source.tar.gz
+          cat transport/source.tar.gz.b64.part-* | tr -d '\r\n\t ' | base64 --decode > /tmp/cyberkimi-source.tar.gz
           echo 'e98828687e71805e5f4c4a12f18639e38865849c9dce691de375fc165476ca95  /tmp/cyberkimi-source.tar.gz' | sha256sum --check --strict
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           tar -xzf /tmp/cyberkimi-source.tar.gz -C .
